@@ -10,6 +10,9 @@ pub enum TensorError {
 
     #[error("Cannot reshape {original:?} to {target:?}. Element count must match")]
     InvalidReshape {original : Vec<usize>, target : Vec<usize>},
+    
+    #[error("Cannot broadcast {shape_a:?} to {shape_b:?}")]
+    InvalidBroadcast {shape_a: Vec<usize>, shape_b: Vec<usize>},
 
     #[error("Operation requires contiguous memory layout")]
     NotContiguous,
