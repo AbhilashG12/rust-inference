@@ -3,7 +3,7 @@ pub mod shape;
 pub mod tensor;
 pub mod ops;
 pub mod nn;
-
+pub mod kernels;
 
 #[cfg(test)]
 mod tests {

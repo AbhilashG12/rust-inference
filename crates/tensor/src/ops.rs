@@ -1,5 +1,6 @@
 use crate::tensor::Tensor;
 use crate::error::{Result,TensorError};
+use crate::kernels::MatMulDispatcher;
 
 impl Tensor{
 
@@ -40,19 +41,7 @@ impl Tensor{
 
         let mut out = Tensor::zeroes(vec![m,n]);
 
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = 0.0;
-                for p in 0..k {
-                    let a_idx = i * self.strides[0] + p * self.strides[1];
-                    let b_idx = p * other.strides[0] + j * other.strides[1];
-                    sum += self.data[a_idx] * other.data[b_idx];
-                }
-                let out_idx = i * out.strides[0] + j * out.strides[1];
-                out.data[out_idx] = sum;
-            }
-        }
-
+        MatMulDispatcher::dispatch(self, other, &mut out, m, k, n);
         Ok(out)
     }
 
@@ -126,6 +115,34 @@ impl Tensor{
             }
         }
 
+        Ok(out)
+    }
+
+    pub fn fused_matmul_add_relu(&self, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
+        let m = self.shape.dims()[0];
+        let k = self.shape.dims()[1];
+        let n = weight.shape.dims()[1];
+
+        let mut out = Tensor::zeroes(vec![m, n]);
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for p in 0..k {
+                    let a_idx = i * self.strides[0] + p * self.strides[1];
+                    let b_idx = p * weight.strides[0] + j * weight.strides[1];
+                    sum += self.data[a_idx] * weight.data[b_idx];
+                }
+                
+                let bias_idx = j * bias.strides[0];
+                sum += bias.data[bias_idx];
+                
+                if sum < 0.0 {
+                    sum = 0.0;
+                }
+                let out_idx = i * out.strides[0] + j * out.strides[1];
+                out.data[out_idx] = sum;
+            }
+        }
         Ok(out)
     }
 
