@@ -145,6 +145,74 @@ impl Tensor{
         }
         Ok(out)
     }
+    
+    pub fn rms_norm(&self, weight: &Tensor, eps: f32) -> Result<Tensor> {
+        let features = self.shape.dims().last().unwrap();
+        let batch = self.shape.numel() / features;
+        
+        let mut out = Tensor::zeroes(self.shape.dims().to_vec());
 
+        for b in 0..batch {
+            let offset = b * features;
+            
+            let mut sum_sq = 0.0;
+            for f in 0..*features {
+                let val = self.data[offset + f];
+                sum_sq += val * val;
+            }
+            
+            let mean_sq = sum_sq / (*features as f32);
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            
+            for f in 0..*features {
+                out.data[offset + f] = (self.data[offset + f] * inv_rms) * weight.data[f];
+            }
+        }
+        Ok(out)
+    }
 
+    pub fn silu(&self) -> Tensor {
+        let data = self.data.iter().map(|&x| {
+            x * (1.0 / (1.0 + (-x).exp()))
+        }).collect();
+        Tensor::new(data, self.shape.dims().to_vec()).unwrap()
+    }
+    
+    pub fn apply_rope(&self, pos: usize) -> Tensor {
+        let mut out = self.clone();
+        let features = self.shape.dims().last().unwrap();
+        
+        for i in (0..*features).step_by(2) {
+            let theta = 10000.0_f32.powf(-((i as f32) / (*features as f32)));
+            let angle = (pos as f32) * theta;
+            
+            let cos_val = angle.cos();
+            let sin_val = angle.sin();
+            
+            let x0 = self.data[i];
+            let x1 = self.data[i + 1];
+            
+            out.data[i] = x0 * cos_val - x1 * sin_val;
+            out.data[i + 1] = x0 * sin_val + x1 * cos_val;
+        }
+        out
+    }
+
+    pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let d_k = q.shape.dims().last().unwrap();
+        let scale = 1.0 / (*d_k as f32).sqrt();
+
+        let k_t = k.clone().transpose_2d()?;
+        let mut scores = q.matmul(&k_t)?;
+        
+        for val in scores.data.iter_mut() {
+            *val *= scale;
+        }
+        
+        let probs = scores.softmax()?;
+        
+        let out = probs.matmul(v)?;
+        
+        Ok(out)
+    }
 }

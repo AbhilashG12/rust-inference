@@ -3,6 +3,7 @@ pub mod shape;
 pub mod tensor;
 pub mod ops;
 pub mod nn;
+pub mod quant;
 pub mod kernels;
 
 #[cfg(test)]
@@ -61,8 +62,6 @@ mod phase2_tests {
 
     #[test]
     fn test_tiny_neural_network() {
-        // --- 1. Define the Weights ---
-        // Layer 1: 3 in, 4 out
         let l1_weight = Tensor::new(vec![
             0.1,  0.2, -0.1,  0.3,
            -0.2,  0.1,  0.5, -0.1,
@@ -71,7 +70,6 @@ mod phase2_tests {
         let l1_bias = Tensor::new(vec![0.1, -0.1, 0.2, 0.0], vec![4]).unwrap();
         let layer1 = Linear::new(l1_weight, l1_bias);
 
-        // Layer 2: 4 in, 2 out (classes)
         let l2_weight = Tensor::new(vec![
             0.5, -0.2,
            -0.3,  0.1,
@@ -81,26 +79,50 @@ mod phase2_tests {
         let l2_bias = Tensor::new(vec![0.05, -0.05], vec![2]).unwrap();
         let layer2 = Linear::new(l2_weight, l2_bias);
 
-        // --- 2. Define the Input ---
         let input = Tensor::new(vec![1.0, 2.0, -1.0], vec![1, 3]).unwrap();
-
-        // --- 3. Execute the Forward Pass ---
-        // Step A: Linear 1
         let out1 = layer1.forward(&input).unwrap();
-        
-        // Step B: ReLU
         let out_relu = out1.relu();
-
-        // Step C: Linear 2
         let out2 = layer2.forward(&out_relu).unwrap();
-
-        // Step D: Softmax
         let probabilities = out2.softmax().unwrap();
 
-        // --- 4. Golden Reference Verification ---
-        // I calculated this reference output using PyTorch with the exact same weights.
-        // Expected logits before softmax: [0.02, 0.38]
-        // Expected softmax probs: [0.410959, 0.589040]
         assert_close(&probabilities.data, &[0.410959, 0.589040]);
     }
-}   
+}
+
+#[cfg(test)]
+mod transformer_tests {
+    use super::*;
+    use crate::tensor::Tensor;
+    use crate::nn::{Linear, TransformerBlock};
+    use crate::quant::QuantizedTensor;
+
+    #[test]
+    fn test_transformer_and_quantization() {
+        let hidden_dim = 4;
+        
+        let raw_weight = Tensor::zeroes(vec![hidden_dim, hidden_dim]);
+        
+        let q_weight = QuantizedTensor::quantize(&raw_weight);
+        assert_eq!(q_weight.data.len(), 16); 
+        
+        let deq_weight = q_weight.dequantize();
+        
+        let block = TransformerBlock {
+            norm1: Tensor::new(vec![1.0; 4], vec![4]).unwrap(),
+            w_q: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
+            w_k: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
+            w_v: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
+            w_o: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
+            norm2: Tensor::new(vec![1.0; 4], vec![4]).unwrap(),
+            ffn_up: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
+            ffn_down: Linear::new(deq_weight, Tensor::zeroes(vec![4])),
+        };
+
+        let input_token = Tensor::new(vec![0.1, 0.2, -0.1, 0.5], vec![1, 4]).unwrap();
+        
+        let output = block.forward(&input_token, 0).unwrap();
+        
+        assert_eq!(output.shape.dims(), &[1, 4]);
+        println!(" Transformer Forward Pass Successful with Quantized Weights!");
+    }
+}
