@@ -1,50 +1,48 @@
-use graph::builder::GraphBuilder;
-use graph::executor::Executor;
 use model::loader::ModelLoader;
 use tensor::tensor::Tensor;
+use tensor::nn::{Linear, TransformerBlock};
+use tensor::quant::QuantizedTensor;
 
+fn main() {
+    println!(" Loading real Hugging Face LLaMA weights...");
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Starting Rust Inference Engine...");
+    let weights = ModelLoader::load_safetensors("tiny_llama.safetensors")
+        .expect("Failed to load tiny_llama.safetensors");
 
-    println!("Loading mnist.safetensors...");
-    let weights = ModelLoader::load_safetensors("mnist.safetensors")
-        .expect("Failed to load model weights. Ensure mnist.safetensors exists.");
-
-    let mut builder = GraphBuilder::new();
-
-    let w1_id = builder.add_tensor(weights.get("layer1.weight").unwrap().clone());
-    let b1_id = builder.add_tensor(weights.get("layer1.bias").unwrap().clone());
-    let w2_id = builder.add_tensor(weights.get("layer2.weight").unwrap().clone());
-    let b2_id = builder.add_tensor(weights.get("layer2.bias").unwrap().clone());
-
-    let dummy_image = Tensor::zeros(vec![1, 784]);
-    let input_id = builder.add_tensor(dummy_image);
-
-    println!("Compiling Graph...");
+    let norm_weight = weights.get("model.layers.0.input_layernorm.weight").unwrap();
+    let hidden_dim = norm_weight.shape.dims()[0];
+    println!(" Detected Model Hidden Dimension: {}", hidden_dim);
     
-    let x = builder.matmul(input_id, w1_id)?;
-    let x = builder.add_broadcast(x, b1_id)?;
-    let x = builder.relu(x)?;
+    let get_linear = |name: &str| -> Linear {
+        let raw = weights.get(name).expect(&format!("Missing {}", name));
+        let q_tensor = QuantizedTensor::quantize(raw);
+        let weight = q_tensor.dequantize();
+        
+        let out_dim = weight.shape.dims()[1];
+        let bias = Tensor::zeroes(vec![out_dim]);
+        
+        Linear::new(weight, bias)
+    };
 
-    let x = builder.matmul(x, w2_id)?;
-    let logits = builder.add_broadcast(x, b2_id)?;
+    println!(" Building Transformer Block 0...");
+    let block = TransformerBlock {
+        norm1: norm_weight.clone(),
+        norm2: weights.get("model.layers.0.post_attention_layernorm.weight").unwrap().clone(),
+        
+        w_q: get_linear("model.layers.0.self_attn.q_proj.weight"),
+        w_k: get_linear("model.layers.0.self_attn.k_proj.weight"),
+        w_v: get_linear("model.layers.0.self_attn.v_proj.weight"),
+        w_o: get_linear("model.layers.0.self_attn.o_proj.weight"),
+        
+        ffn_up: get_linear("model.layers.0.mlp.up_proj.weight"),
+        ffn_down: get_linear("model.layers.0.mlp.down_proj.weight"),
+    };
 
-    let mut graph = builder.build();
-    println!("Executing Graph...");
-    Executor::run(&mut graph)?;
-    let output_tensor = &graph.tensors[logits.0];
-    let probabilities = output_tensor.softmax()?;
-    let mut best_digit = 0;
-    let mut highest_prob = f32::NEG_INFINITY;
+    let dummy_input = Tensor::zeroes(vec![1, hidden_dim]);
+
+    println!("Running Forward Pass...");
+    let output = block.forward(&dummy_input, 0).expect("Forward pass crashed!");
     
-    for (digit, &prob) in probabilities.data.iter().enumerate() {
-        if prob > highest_prob {
-            highest_prob = prob;
-            best_digit = digit;
-        }
-    }
-
-    println!("🎯 Prediction: Digit {}, Confidence: {:.2}%", best_digit, highest_prob * 100.0);
-    Ok(())
+    println!(" Forward Pass Complete!");
+    println!(" Output Shape: {:?}", output.shape.dims());
 }

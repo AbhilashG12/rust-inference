@@ -215,4 +215,19 @@ impl Tensor{
         
         Ok(out)
     }
+
+    pub fn repeat_features(&self, target_dim: usize) -> Result<Tensor> {
+        let current_dim = *self.shape.dims().last().unwrap();
+        if current_dim == target_dim {
+            return Ok(self.clone());
+        }
+        let repeats = target_dim / current_dim;
+        let mut data = Vec::with_capacity(target_dim);
+        
+        for _ in 0..repeats {
+            data.extend_from_slice(&self.data);
+        }
+        
+        Tensor::new(data, vec![1, target_dim])
+    }
 }

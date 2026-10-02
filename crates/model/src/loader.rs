@@ -36,7 +36,10 @@ impl ModelLoader {
                     f32::from_le_bytes(array)
                 })
                 .collect();
-            let my_tensor = Tensor::new(data, shape).map_err(|_| LoaderError::EngineError)?;
+            let mut my_tensor = Tensor::new(data, shape).map_err(|_| LoaderError::EngineError)?;
+            if my_tensor.shape.rank() == 2 {
+                my_tensor = my_tensor.transpose_2d().map_err(|_| LoaderError::EngineError)?;
+            }
             tensors.insert(name.to_string(), my_tensor);
         }
 

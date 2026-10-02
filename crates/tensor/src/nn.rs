@@ -28,7 +28,11 @@ impl TransformerBlock {
         
         let mut q = self.w_q.forward(&norm_x)?;
         let mut k = self.w_k.forward(&norm_x)?;
-        let v = self.w_v.forward(&norm_x)?;
+        let mut v = self.w_v.forward(&norm_x)?;
+
+        let q_dim = *q.shape.dims().last().unwrap();
+        k = k.repeat_features(q_dim)?;
+        v = v.repeat_features(q_dim)?;
         
         q = q.apply_rope(pos);
         k = k.apply_rope(pos);
