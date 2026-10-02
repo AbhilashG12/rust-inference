@@ -1,8 +1,8 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use tensor::tensor::Tensor;
 
 fn bench_matmul(c: &mut Criterion) {
-    // We will multiply two 512x512 matrices. 
+    // We will multiply two 512x512 matrices.
     // Naive MatMul does 512^3 = 134 MILLION math operations.
     let m = 512;
     let k = 512;
@@ -16,7 +16,7 @@ fn bench_matmul(c: &mut Criterion) {
     let b = Tensor::new(data_b, vec![k, n]).unwrap();
 
     let mut group = c.benchmark_group("MatMul_512x512");
-    
+
     group.bench_function("Optimized_SIMD_Parallel", |b_env| {
         b_env.iter(|| {
             // We use black_box to stop the compiler from optimizing away the call
@@ -24,7 +24,7 @@ fn bench_matmul(c: &mut Criterion) {
             black_box(result);
         });
     });
-    
+
     group.finish();
 }
 

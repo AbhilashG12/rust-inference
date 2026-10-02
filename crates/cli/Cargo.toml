@@ -7,3 +7,4 @@ edition = "2024"
 tensor = { path = "../tensor"}
 graph = { path = "../graph"}
 model = { path = "../model"}
+clap = { version = "4.4", features = ["derive"] }
