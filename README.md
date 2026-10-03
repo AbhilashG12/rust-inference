@@ -117,9 +117,7 @@ The following benchmark measures a full local forward pass on CPU, compared dire
 | MatMul     | 5367.48   | ~100%              |
 | **Total**  | **5367.48** | **100%**         |
 
-```bash
-# Generate text and profile operator execution time
-cargo run --release -- generate --model smollm.safetensors --tokenizer smollm_tokenizer.json --prompt "Rust is a systems programming language that" --profile
+MatMul is effectively the entire cost of a forward pass — every future optimization hour goes there first.
 
 ### Comparison vs. llama.cpp
 
