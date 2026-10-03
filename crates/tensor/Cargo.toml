@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 thiserror = "1.0"
 rayon = "1.8"
+lazy_static = "1.4"
 
 [dev-dependencies]
 rand = "0.8"

@@ -6,6 +6,7 @@ pub struct TensorId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub usize);
 
+#[derive(Debug,Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
     MatMul,
     Add,

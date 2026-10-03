@@ -25,14 +25,14 @@ impl GraphBuilder {
     }
 
     fn allocate_output(&mut self, shape: Vec<usize>) -> TensorId {
-        let tensor = Tensor::zeros(shape);
+        let tensor = Tensor::zeroes(shape);
         self.add_tensor(tensor)
     }
 
 
     pub fn matmul(&mut self, a: TensorId, b: TensorId) -> Result<TensorId> {
-        let shape_a = self.graph.tensors[a.0].shape().dims();
-        let shape_b = self.graph.tensors[b.0].shape().dims();
+        let shape_a = self.graph.tensors[a.0].shape.dims();
+        let shape_b = self.graph.tensors[b.0].shape.dims();
 
         if shape_a.len() != 2 || shape_b.len() != 2 || shape_a[1] != shape_b[0] {
             return Err(TensorError::InvalidMatmul {
@@ -55,8 +55,8 @@ impl GraphBuilder {
     }
 
     pub fn add_broadcast(&mut self, target: TensorId, bias: TensorId) -> Result<TensorId> {
-        let shape_target = self.graph.tensors[target.0].shape().dims();
-        let shape_bias = self.graph.tensors[bias.0].shape().dims();
+        let shape_target = self.graph.tensors[target.0].shape.dims();
+        let shape_bias = self.graph.tensors[bias.0].shape.dims();
 
         if shape_target.len() != 2 || shape_bias.len() != 1 || shape_target[1] != shape_bias[0] {
             return Err(TensorError::InvalidBroadcast {
@@ -78,7 +78,7 @@ impl GraphBuilder {
     }
 
     pub fn relu(&mut self, target: TensorId) -> Result<TensorId> {
-        let shape = self.graph.tensors[target.0].shape().dims().to_vec();
+        let shape = self.graph.tensors[target.0].shape.dims().to_vec();
         let out_id = self.allocate_output(shape);
 
         self.graph.nodes.push(Node {
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(graph.nodes.len(), 4);
 
         // Ensure Shape Inference worked: Logits should be [1, 2]
-        let logits_shape = graph.tensors[logits_id.0].shape().dims();
+        let logits_shape = graph.tensors[logits_id.0].shape.dims();
         assert_eq!(logits_shape, &[1, 2]);
 
         //  Execute the Graph
@@ -169,8 +169,8 @@ mod tests {
         let mut builder = GraphBuilder::new();
         
         // Mismatched shapes: [1, 3] trying to MatMul with [4, 2]
-        let input = Tensor::zeros(vec![1, 3]);
-        let weight = Tensor::zeros(vec![4, 2]); // Should be [3, 2]
+        let input = Tensor::zeroes(vec![1, 3]);
+        let weight = Tensor::zeroes(vec![4, 2]); // Should be [3, 2]
         
         let in_id = builder.add_tensor(input);
         let w_id = builder.add_tensor(weight);

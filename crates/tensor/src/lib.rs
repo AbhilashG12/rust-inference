@@ -7,6 +7,7 @@ pub mod quant;
 pub mod sampler;
 pub mod shape;
 pub mod tensor;
+pub mod profiler;
 
 #[cfg(test)]
 mod tests {
@@ -50,11 +51,12 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 mod phase2_tests {
-    use super::*;
+    // use super::*;
     use crate::nn::Linear;
     use crate::tensor::Tensor;
-
+    #[allow(dead_code)]
     fn assert_close(a: &[f32], b: &[f32]) {
         for (x, y) in a.iter().zip(b.iter()) {
             assert!((x - y).abs() < 1e-4, "Mismatch: {} != {}", x, y);
@@ -90,10 +92,11 @@ mod phase2_tests {
 
 #[cfg(test)]
 mod transformer_tests {
-    use super::*;
+    // use super::*;
     use crate::nn::{Linear, TransformerBlock};
     use crate::quant::QuantizedTensor;
     use crate::tensor::Tensor;
+    use crate::cache::KVCache;
 
     #[test]
     fn test_transformer_and_quantization() {
@@ -113,13 +116,14 @@ mod transformer_tests {
             w_v: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
             w_o: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
             norm2: Tensor::new(vec![1.0; 4], vec![4]).unwrap(),
+            ffn_gate: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
             ffn_up: Linear::new(deq_weight.clone(), Tensor::zeroes(vec![4])),
             ffn_down: Linear::new(deq_weight, Tensor::zeroes(vec![4])),
         };
 
         let input_token = Tensor::new(vec![0.1, 0.2, -0.1, 0.5], vec![1, 4]).unwrap();
-
-        let output = block.forward(&input_token, 0).unwrap();
+        let mut kv_cache = KVCache::new(1);
+        let output = block.forward(&input_token, 0, 0, &mut kv_cache).unwrap();
 
         assert_eq!(output.shape.dims(), &[1, 4]);
         println!(" Transformer Forward Pass Successful with Quantized Weights!");

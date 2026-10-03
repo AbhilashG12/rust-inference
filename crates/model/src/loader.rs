@@ -39,9 +39,18 @@ impl ModelLoader {
                 .collect();
             let mut my_tensor = Tensor::new(data, shape).map_err(|_| LoaderError::EngineError)?;
             if my_tensor.shape.rank() == 2 && !name.contains("embed") {
-                my_tensor = my_tensor
-                    .transpose_2d()
-                    .map_err(|_| LoaderError::EngineError)?;
+                let transposed = my_tensor.transpose_2d().map_err(|_| LoaderError::EngineError)?;
+                let rows = transposed.shape.dims()[0];
+                let cols = transposed.shape.dims()[1];
+                let mut contiguous_data = Vec::with_capacity(rows * cols);
+                
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let idx = r * transposed.strides[0] + c * transposed.strides[1];
+                        contiguous_data.push(transposed.data[idx]);
+                    }
+                }
+                my_tensor = Tensor::new(contiguous_data, vec![rows, cols]).map_err(|_| LoaderError::EngineError)?;
             }
             tensors.insert(name.to_string(), my_tensor);
         }

@@ -1,6 +1,7 @@
 use crate::error::{Result, TensorError};
 use crate::kernels::MatMulDispatcher;
 use crate::tensor::Tensor;
+use crate::profiler::ProfileScope;
 
 impl Tensor {
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
@@ -24,6 +25,7 @@ impl Tensor {
     }
 
     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+        let _prof = ProfileScope::new("MatMul");
         if self.shape.rank() != 2 || other.shape.rank() != 2 {
             return Err(TensorError::InvalidMatmul {
                 shape_a: self.shape.dims().to_vec(),
@@ -191,56 +193,144 @@ impl Tensor {
 
     pub fn apply_rope(&self, pos: usize) -> Tensor {
         let mut out = self.clone();
-        let features = self.shape.dims().last().unwrap();
+        let features = *self.shape.dims().last().unwrap();
+        let head_dim = 64;
+        let half = head_dim / 2; // 32
 
-        for i in (0..*features).step_by(2) {
-            let theta = 10000.0_f32.powf(-((i as f32) / (*features as f32)));
-            let angle = (pos as f32) * theta;
+        for h in 0..(features / head_dim) {
+            let offset = h * head_dim;
 
-            let cos_val = angle.cos();
-            let sin_val = angle.sin();
+            for i in 0..half {
+                // Standard LLaMA theta calculation
+                let freq = 1.0_f32 / 10000.0_f32.powf((2 * i) as f32 / head_dim as f32);
+                let val = (pos as f32) * freq;
+                let cos_val = val.cos();
+                let sin_val = val.sin();
 
-            let x0 = self.data[i];
-            let x1 = self.data[i + 1];
+                let x0 = self.data[offset + i];
+                let x1 = self.data[offset + i + half];
 
-            out.data[i] = x0 * cos_val - x1 * sin_val;
-            out.data[i + 1] = x0 * sin_val + x1 * cos_val;
+                // HuggingFace: [-x2, x1] rotated with cos/sin
+                out.data[offset + i] = x0 * cos_val - x1 * sin_val;
+                out.data[offset + i + half] = x1 * cos_val + x0 * sin_val;
+            }
         }
         out
     }
 
-    pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-        let d_k = q.shape.dims().last().unwrap();
-        let scale = 1.0 / (*d_k as f32).sqrt();
-
-        let k_t = k.clone().transpose_2d()?;
-        let mut scores = q.matmul(&k_t)?;
-
-        for val in scores.data.iter_mut() {
-            *val *= scale;
-        }
-
-        let probs = scores.softmax()?;
-
-        let out = probs.matmul(v)?;
-
-        Ok(out)
-    }
-
     pub fn repeat_features(&self, target_dim: usize) -> Result<Tensor> {
         let current_dim = *self.shape.dims().last().unwrap();
-        if current_dim == target_dim {
-            return Ok(self.clone());
-        }
+        if current_dim == target_dim { return Ok(self.clone()); }
+        
         let repeats = target_dim / current_dim;
+        let head_dim = 64; // Block-repeat based on Head Dimension!
+        let num_kv_heads = current_dim / head_dim;
+        
         let mut data = Vec::with_capacity(target_dim);
-
-        for _ in 0..repeats {
-            data.extend_from_slice(&self.data);
+        
+        // Correct Block-Mapping for GQA (K1, K1, K1, K2, K2, K2)
+        for h in 0..num_kv_heads {
+            let start = h * head_dim;
+            let end = start + head_dim;
+            let head_data = &self.data[start..end];
+            
+            for _ in 0..repeats {
+                data.extend_from_slice(head_data);
+            }
         }
-
+        
         Tensor::new(data, vec![1, target_dim])
     }
+
+    pub fn mul(&self, other: &Tensor) -> Result<Tensor> {
+        if self.shape != other.shape {
+            return Err(TensorError::ShapeMismatch {
+                expected: self.shape.dims().to_vec(),
+                got: other.shape.dims().to_vec(),
+            });
+        }
+        
+        let data = self
+            .data
+            .iter()
+            .zip(other.data.iter())
+            .map(|(a, b)| a * b)
+            .collect();
+            
+        Tensor::new(data, self.shape.dims().to_vec())
+    }
+
+    pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let features = *q.shape.dims().last().unwrap();
+        let seq_len = k.shape.dims()[0];
+        
+        let head_dim = 64; 
+        let num_heads = features / head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt(); // Correct Multi-Head scaling!
+        
+        let mut out_data = Vec::with_capacity(features);
+
+        // Process each Attention Head completely independently
+        for h in 0..num_heads {
+            let head_offset = h * head_dim;
+            
+            // 1. Extract Q for this specific head -> Shape: [1, 64]
+            let mut q_head_data = Vec::with_capacity(head_dim);
+            for i in 0..head_dim {
+                q_head_data.push(q.data[head_offset + i]);
+            }
+            let q_head = Tensor::new(q_head_data, vec![1, head_dim]).unwrap();
+            
+            // 2. Extract K for this specific head across the whole sequence -> Shape: [Seq_Len, 64]
+            let mut k_head_data = Vec::with_capacity(seq_len * head_dim);
+            for s in 0..seq_len {
+                for i in 0..head_dim {
+                    let idx = s * k.strides[0] + (head_offset + i) * k.strides[1];
+                    k_head_data.push(k.data[idx]);
+                }
+            }
+            let k_head = Tensor::new(k_head_data, vec![seq_len, head_dim]).unwrap();
+            
+            // 3. Extract V for this specific head across the whole sequence -> Shape: [Seq_Len, 64]
+            let mut v_head_data = Vec::with_capacity(seq_len * head_dim);
+            for s in 0..seq_len {
+                for i in 0..head_dim {
+                    let idx = s * v.strides[0] + (head_offset + i) * v.strides[1];
+                    v_head_data.push(v.data[idx]);
+                }
+            }
+            let v_head = Tensor::new(v_head_data, vec![seq_len, head_dim]).unwrap();
+
+            // 4. Compute standard Attention for JUST this head!
+            let k_t_lazy = k_head.transpose_2d().unwrap();
+            let rows = k_t_lazy.shape.dims()[0];
+            let cols = k_t_lazy.shape.dims()[1];
+            let mut k_t_data = Vec::with_capacity(rows * cols);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let idx = r * k_t_lazy.strides[0] + c * k_t_lazy.strides[1];
+                    k_t_data.push(k_t_lazy.data[idx]);
+                }
+            }
+            let k_t = Tensor::new(k_t_data, vec![rows, cols]).unwrap();
+            
+            let mut scores = q_head.matmul(&k_t).unwrap();
+            
+            for val in scores.data.iter_mut() {
+                *val *= scale;
+            }
+            
+            let probs = scores.softmax().unwrap();
+            let head_out = probs.matmul(&v_head).unwrap();
+            
+            // 5. Append this head's output to the final concatenated vector
+            out_data.extend_from_slice(&head_out.data);
+        }
+        
+        // Return the re-assembled 576-feature vector
+        Ok(Tensor::new(out_data, vec![1, features]).unwrap())
+    }
+
 
     pub fn concat_seq(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         let shape_a = a.shape.dims();

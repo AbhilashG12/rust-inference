@@ -19,6 +19,7 @@ pub struct TransformerBlock {
     pub w_o: Linear,
 
     pub norm2: Tensor,
+    pub ffn_gate: Linear,
     pub ffn_up: Linear,
     pub ffn_down: Linear,
 }
@@ -49,15 +50,18 @@ impl TransformerBlock {
         let attn_out = Tensor::attention(&q, &full_k, &full_v)?;
 
         let proj_out = self.w_o.forward(&attn_out)?;
-        let mut residual_1 = x.add(&proj_out)?;
+        let residual_1 = x.add(&proj_out)?;
 
         let norm_res_1 = residual_1.rms_norm(&self.norm2, 1e-5)?;
-        let hidden = self.ffn_up.forward(&norm_res_1)?;
-        let activated = hidden.silu();
-        let ffn_out = self.ffn_down.forward(&activated)?;
-
+        let gate = self.ffn_gate.forward(&norm_res_1)?;
+        let activated_gate = gate.silu();
+        let up = self.ffn_up.forward(&norm_res_1)?;
+    
+        let hidden = activated_gate.mul(&up)?;
+        
+        let ffn_out = self.ffn_down.forward(&hidden)?;
+        
         let final_out = residual_1.add(&ffn_out)?;
-
         Ok(final_out)
     }
 }

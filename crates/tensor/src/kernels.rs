@@ -1,3 +1,4 @@
+#![allow(unsafe_op_in_unsafe_fn, unused_variables)]
 use crate::tensor::Tensor;
 use rayon::prelude::*;
 

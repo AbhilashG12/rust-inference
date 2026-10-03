@@ -30,6 +30,9 @@ impl Executor {
                     let result = a.softmax()?;
                     graph.tensors[node.outputs[0].0] = result;
                 }
+                Operator::FusedMatMulAddRelu => {
+                    unimplemented!("Fused operators should be run by the Phase 4 Runtime, not the naive Executor!");
+                }
             }
         }
         Ok(())
