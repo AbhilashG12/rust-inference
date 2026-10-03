@@ -113,10 +113,7 @@ You can inspect models, run the profiler, or generate text directly from the CLI
 
 ```bash
 # Generate text and profile operator execution time
-cargo run --release -- generate \
-  --model smollm.safetensors \
-  --tokenizer smollm_tokenizer.json \
-  --prompt "Rust is a systems programming language that"
+cargo run --release -- generate --model smollm.safetensors --tokenizer smollm_tokenizer.json --prompt "Rust is a systems programming language that"
 
 # Inspect SafeTensors architecture without executing
 cargo run --release -- inspect --model smollm.safetensors
@@ -126,13 +123,13 @@ cargo run --release -- inspect --model smollm.safetensors
 
 ```bash
 # Download the SmolLM-135M model weights (~540 MB)
-curl -L -o smollm.safetensors \
-  https://huggingface.co/HuggingFaceTB/SmolLM-135M/resolve/main/model.safetensors
+curl -L -o smollm.safetensors https://huggingface.co/HuggingFaceTB/SmolLM-135M/resolve/main/model.safetensors
 
 # Download the corresponding tokenizer (~2 MB)
-curl -L -o smollm_tokenizer.json \
-  https://huggingface.co/HuggingFaceTB/SmolLM-135M/resolve/main/tokenizer.json
+curl -L -o smollm_tokenizer.json https://huggingface.co/HuggingFaceTB/SmolLM-135M/resolve/main/tokenizer.json
 ```
+
+> **Windows (PowerShell):** use `curl.exe` instead of `curl`, since `curl` is an alias for `Invoke-WebRequest`.
 
 ## Future Work (v1.1 and Beyond)
 
