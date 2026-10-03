@@ -113,7 +113,7 @@ You can inspect models, run the profiler, or generate text directly from the CLI
 
 ```bash
 # Generate text and profile operator execution time
-cargo run --release -- generate --model smollm.safetensors --tokenizer smollm_tokenizer.json --prompt "Rust is a systems programming language that"
+cargo run --release -- generate --model smollm.safetensors --tokenizer smollm_tokenizer.json --prompt "Rust is a systems programming language that" --profile
 
 # Inspect SafeTensors architecture without executing
 cargo run --release -- inspect --model smollm.safetensors
