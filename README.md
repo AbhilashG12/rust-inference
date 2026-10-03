@@ -1,6 +1,6 @@
 # Rust Inference Engine (v1.0.0)
 
-A pure-Rust, zero-dependency Large Language Model (LLM) inference runtime built from first principles.
+A pure-Rust LLM inference runtime built from first principles — no PyTorch, ONNX, llama.cpp, or ML-framework dependencies anywhere in the execution core.
 
 This project is a fully functional LLM execution engine capable of loading pretrained HuggingFace models (like SmolLM/LLaMA architectures) via SafeTensors, managing memory layouts with custom strided tensors, and performing autoregressive text generation using hardware-accelerated AVX2 SIMD operations.
 
@@ -14,6 +14,8 @@ The project evolved from a basic Neural Network (NN) execution graph into a spec
 - **Rotary Positional Embeddings (RoPE)** so the model understands word order.
 - **Grouped Query Attention (GQA)** to map relationships between words efficiently.
 - **SwiGLU** feed-forward networks for complex reasoning.
+
+**On dependencies:** the tensor, attention, and SIMD execution core — the actual mathematical engine — is hand-built with no ML framework underneath it. External crates are used only for solved, non-core problems: `safetensors` (weight file parsing), `tokenizers` (HuggingFace's own BPE tokenizer), `memmap2` (zero-copy file loading), `clap` (CLI), `rayon` (CPU parallelism), and `thiserror` (error handling).
 
 ## Architecture
 
@@ -83,41 +85,60 @@ Wiring up a real 135-million parameter model initially produced complete word sa
 
 ## Reproducible Benchmark
 
-The following benchmark demonstrates the engine's performance running a fully local forward pass on CPU.
+The following benchmark measures a full local forward pass on CPU, compared directly against `llama.cpp` running the same model and prompt on the same machine.
 
 ### Environment & Setup
 
-| Setting    | Value              |
-|------------|--------------------|
-| Model      | SmolLM             |
-| Parameters | 135M               |
-| Precision  | FP32               |
-| Backend    | Rust CPU (AVX2 SIMD) |
-| KV Cache   | Enabled            |
-| GQA        | Enabled            |
+| Setting    | This Engine            | llama.cpp (baseline) |
+|------------|-------------------------|------------------------|
+| Model      | SmolLM-135M             | SmolLM-135M-Instruct  |
+| Precision  | FP32                    | F16                    |
+| Backend    | Rust CPU (AVX2 SIMD)    | GGML (CPU)             |
+| KV Cache   | Enabled                 | Enabled                |
+| GQA        | Enabled                 | Enabled                |
+| Prompt     | "Rust is a systems programming language that" | same |
 
-### Performance Metrics
+### This Engine — Performance Metrics
 
-| Metric                  | Value          |
-|-------------------------|----------------|
-| Prompt tokens           | 4              |
-| Generated tokens        | ~50            |
-| Prefill latency         | ~200 ms        |
-| Decode speed            | ~10.6 tokens/sec |
-| KV cache memory/token   | 135.00 KB      |
-| Peak KV cache memory    | ~7.2 MB        |
+| Metric                 | Value                  |
+|-------------------------|-------------------------|
+| Prompt tokens           | 4                       |
+| Generated tokens        | 50                      |
+| Prefill latency         | 779.36 ms               |
+| Decode latency          | 5081.29 ms              |
+| Decode speed            | 9.84 tokens/sec         |
+| KV cache memory/token   | 135.00 KB               |
+| Total KV cache memory   | 7965.00 KB (~7.78 MB)   |
 
-## Usage
+### Operator Profiling
 
-You can inspect models, run the profiler, or generate text directly from the CLI.
+| Operator   | Time (ms) | % of forward pass |
+|------------|-----------|--------------------|
+| MatMul     | 5367.48   | ~100%              |
+| **Total**  | **5367.48** | **100%**         |
 
 ```bash
 # Generate text and profile operator execution time
 cargo run --release -- generate --model smollm.safetensors --tokenizer smollm_tokenizer.json --prompt "Rust is a systems programming language that" --profile
 
-# Inspect SafeTensors architecture without executing
-cargo run --release -- inspect --model smollm.safetensors
-```
+### Comparison vs. llama.cpp
+
+| Engine              | Decode Speed | Precision |
+|---------------------|--------------|-----------|
+| **This engine**     | 9.84 tok/s   | FP32      |
+| llama.cpp (run 1)   | 50.9 tok/s   | F16       |
+| llama.cpp (run 2)   | 39.4 tok/s   | F16       |
+
+This engine is roughly **4–5x slower** than llama.cpp on identical hardware and prompt. That gap is expected against a project with years of dedicated CPU-kernel engineering — the useful part is understanding *why*:
+
+- **Decode is memory-bandwidth-bound, not compute-bound.** Each decode step is a matrix × *vector* operation (one new token against the weight matrices), not matrix × matrix — so the bottleneck is bytes streamed from RAM per token, not FLOPs/sec.
+- **Precision compounds this directly.** This engine stores weights as FP32 (4 bytes/weight); llama.cpp's GGUF is F16 (2 bytes/weight) — roughly half the memory traffic per token before any kernel-quality difference even enters.
+- llama.cpp's GGML kernels are specifically hand-tuned for this single-token (`M=1`) regime; this engine's AVX2 path is not yet specialized for it.
+
+**Next optimization target, in order:**
+1. Confirm the AVX2 path actually fires for the `M=1` decode shape rather than falling back to a scalar loop.
+2. Move weight storage to F16 to roughly halve decode-time memory traffic.
+3. Re-check whether `rayon` parallelism helps or hurts a single-row decode matmul — thread-spawn overhead can exceed the work itself at this size.
 
 ### Download the model and tokenizer
 
@@ -131,11 +152,35 @@ curl -L -o smollm_tokenizer.json https://huggingface.co/HuggingFaceTB/SmolLM-135
 
 > **Windows (PowerShell):** use `curl.exe` instead of `curl`, since `curl` is an alias for `Invoke-WebRequest`.
 
+#### Optional: reproduce the llama.cpp comparison
+
+```bash
+# Download the F16 GGUF build of the same model
+curl -L -o smollm-135m.gguf https://huggingface.co/second-state/SmolLM-135M-Instruct-GGUF/resolve/main/SmolLM-135M-Instruct-f16.gguf
+
+# Run with the same prompt used above
+llama-cli.exe -m smollm-135m.gguf -p "Rust is a systems programming language that" -n 50 -c 512
+```
+
+## Usage
+
+You can inspect models, run the profiler, or generate text directly from the CLI.
+
+```bash
+# Generate text and profile operator execution time
+cargo run --release -- generate --model smollm.safetensors --tokenizer smollm_tokenizer.json --prompt "Rust is a systems programming language that" --profile
+
+# Inspect SafeTensors architecture without executing
+cargo run --release -- inspect --model smollm.safetensors
+```
+
+> **Windows (PowerShell):** use `curl.exe` instead of `curl`, since `curl` is an alias for `Invoke-WebRequest`.
+
 ## Future Work (v1.1 and Beyond)
 
-Having established a mathematically sound baseline, future development will focus on scaling and optimization:
+Having established a mathematically sound, benchmarked baseline, future development will focus on scaling and optimization:
 
-- **Quantization:** Reintroducing robust INT8/INT4 kernels for larger models (like Llama-3-8B).
+- **Quantization (highest priority — see benchmark analysis above):** F16 weight storage first, then INT8/INT4 kernels for larger models (like Llama-3-8B).
 - **Sampling Improvements:** Refining Top-K and Top-P penalty logic.
 - **Serving Architecture:** Paged KV Cache and continuous batching.
 - **Hardware Backends:** Exploring GPU execution (CUDA/Metal).
