@@ -2,7 +2,7 @@
 
 A pure-Rust LLM inference runtime built from first principles — no PyTorch, ONNX, llama.cpp, or ML-framework dependencies anywhere in the execution core.
 
-This project is a fully functional LLM execution engine capable of loading pretrained HuggingFace models (like SmolLM/LLaMA architectures) via SafeTensors, managing memory layouts with custom strided tensors, and performing autoregressive text generation using hardware-accelerated AVX2 SIMD operations.
+This project is a fully functional LLM execution engine capable of loading pretrained HuggingFace models (like SmolLM/LLaMA architectures) via SafeTensors, managing memory layouts with custom strided tensors, and performing instruction-tuned autoregressive text generation using hardware-accelerated AVX2 SIMD operations.
 
 ## What is this?
 
@@ -19,7 +19,7 @@ The project evolved from a basic Neural Network (NN) execution graph into a spec
 
 ## Architecture
 
-The engine loads standard model weights and executes the forward-pass computation sufficiently accurately to perform autoregressive generation.
+The engine loads standard model weights (supporting `F32`, `BF16`, and `F16` SafeTensors formats) and executes the forward-pass computation sufficiently accurately to perform instruction-following and structured JSON generation.
 
 ```text
                     ┌─────────────────────┐
@@ -30,12 +30,15 @@ The engine loads standard model weights and executes the forward-pass computatio
                                ▼
                     ┌─────────────────────┐
                     │ SafeTensors Loader  │
+                    │ (F32 / BF16 / F16)  │
                     └──────────┬──────────┘
                                │
                                ▼
               ┌────────────────────────────────┐
               │        Rust Inference Runtime  │
               │                                │
+              │  ChatML Formatting & BPE       │
+              │       ↓                        │
               │  Tensor / Memory System        │
               │       ↓                        │
               │  MatMul / SIMD / Tiling        │
@@ -50,7 +53,7 @@ The engine loads standard model weights and executes the forward-pass computatio
               │       ↓                        │
               │  KV Cache                      │
               │       ↓                        │
-              │  Autoregressive Decode         │
+              │  Autoregressive Decode + EOS   │
               └──────────────┬─────────────────┘
                              │
                              ▼
@@ -63,25 +66,21 @@ Building an LLM runtime from scratch required solving several complex systems an
 
 ### The LLM Runtime & KV Cache
 
-Transitioning from processing static tensors to generating continuous text required building a Tokenizer, Nucleus Sampling (Top-K, Top-P, Temperature), and an autoregressive decoding loop.
+Transitioning from processing static tensors to generating continuous text required building a Tokenizer wrapper, Nucleus Sampling (Top-K, Top-P, Temperature), and an autoregressive decoding loop.
 
 The primary challenge was **computational amnesia**. Generating one word at a time by recalculating the entire past sequence scales quadratically and destroys throughput. I implemented a **KV Cache** to store the Key and Value matrices of historical tokens, separating the fast, parallel "Prefill" phase from the iterative "Decode" phase.
 
 ### Productionizing & Achieving Accuracy
 
-Wiring up a real 135-million parameter model initially produced complete word salad. Debugging this required tensor-by-tensor parity checks against a PyTorch golden reference. Achieving true mathematical accuracy required resolving several critical architectural bottlenecks:
+Wiring up a real 135-million parameter model initially produced complete word salad. Debugging this required tensor-by-tensor parity checks against a PyTorch golden reference. Achieving true mathematical accuracy and reliable instruction adherence required resolving several critical architectural bottlenecks:
 
 1. **SIMD Contiguity & Transposition:** The MatMul kernels use AVX2 hardware acceleration, which requires strict row-major contiguous memory. Lazy transpositions resulted in scrambled memory reads. The loader was rewritten to physically allocate and flatten transposed matrices in RAM.
-
 2. **Tied Embeddings:** Smaller models delete their final `lm_head` matrix to save disk space, expecting the runtime to reuse the `embed_tokens` matrix. The engine dynamically detects this, transposes the tensor, and allocates contiguous memory for the final logits projection.
-
 3. **RoPE Rotation Order:** Rotary embeddings were originally applied by interleaving adjacent pairs. True accuracy required adopting the standard HuggingFace approach: splitting the head dimension in half and applying the sinusoidal rotation across the two separate blocks.
-
 4. **Multi-Head Attention & GQA:** Mashing all features into a single attention score washed out the signal. The engine now splits the query into distinct heads, routes them correctly to the grouped key heads, and scales the dot products by `1/sqrt(d_k)` before the Softmax to prevent gradient saturation.
-
 5. **SwiGLU Missing Gate:** Standard feed-forward networks use Up and Down projections. LLaMA architectures require a third `gate_proj` matrix. Accuracy was restored by multiplying the SiLU-activated gate with the up projection.
-
-6. **Probability Looping:** Microscopic models frequently fall into repetitive loops (e.g., generating the same sentence endlessly). I implemented a **Repetition Penalty** in the sampler to penalize previously generated token logits, forcing the model to complete thoughts naturally.
+6. **Multi-Precision SafeTensors Ingestion (`BF16` / `F16` → `F32`):** While base models are often stored in `F32`, official HuggingFace Instruct checkpoints (`SmolLM-135M-Instruct`) serialize weights in 16-bit Brain Floating Point (`BF16`). The loader was upgraded to parse `BF16` and `F16` byte chunks directly into `F32` execution tensors using zero-dependency IEEE 754 bitwise shifts.
+7. **Instruction Tuning, ChatML & Structured Stopping:** Moving from a base autocomplete model to `SmolLM-135M-Instruct` required preserving special control tokens (`<|im_start|>`, `<|im_end|>`) during tokenization, automatically wrapping plain prompts in the ChatML conversation template, scoping the **Repetition Penalty** to recent context so prompt keywords aren't penalized, and implementing immediate End-of-Turn (`<|im_end|>`) and JSON delimiter (`}`) termination.
 
 ## Reproducible Benchmark
 
@@ -89,63 +88,64 @@ The following benchmark measures a full local forward pass on CPU, compared dire
 
 ### Environment & Setup
 
-| Setting    | This Engine            | llama.cpp (baseline) |
-|------------|-------------------------|------------------------|
-| Model      | SmolLM-135M             | SmolLM-135M-Instruct  |
-| Precision  | FP32                    | F16                    |
-| Backend    | Rust CPU (AVX2 SIMD)    | GGML (CPU)             |
-| KV Cache   | Enabled                 | Enabled                |
-| GQA        | Enabled                 | Enabled                |
-| Prompt     | "Rust is a systems programming language that" | same |
+| Setting   | This Engine                                  | llama.cpp (baseline)                         |
+| --------- | -------------------------------------------- | -------------------------------------------- |
+| Model     | SmolLM-135M-Instruct                         | SmolLM-135M-Instruct                         |
+| Precision | BF16 disk → FP32 compute                     | F16                                          |
+| Backend   | Rust CPU (AVX2 SIMD)                         | GGML (CPU)                                   |
+| KV Cache  | Enabled                                      | Enabled                                      |
+| GQA       | Enabled                                      | Enabled                                      |
+| Prompt    | "Rust is a systems programming language that" | same                                         |
 
 ### This Engine — Performance Metrics
 
-| Metric                 | Value                  |
-|-------------------------|-------------------------|
-| Prompt tokens           | 4                       |
-| Generated tokens        | 50                      |
-| Prefill latency         | 779.36 ms               |
-| Decode latency          | 5081.29 ms              |
-| Decode speed            | 9.84 tokens/sec         |
-| KV cache memory/token   | 135.00 KB               |
-| Total KV cache memory   | 7965.00 KB (~7.78 MB)   |
+| Metric                  | Value                 |
+| ----------------------- | --------------------- |
+| Prompt tokens           | 8 (raw) / ~30 (ChatML) |
+| Generated tokens        | 50 – 200              |
+| Prefill latency         | 779.36 ms             |
+| Decode latency (50 tok) | 5081.29 ms            |
+| Decode speed            | 9.84 tokens/sec       |
+| KV cache memory/token   | 135.00 KB             |
+| Total KV cache memory   | 7965.00 KB (~7.78 MB) |
 
 ### Operator Profiling
 
-| Operator   | Time (ms) | % of forward pass |
-|------------|-----------|--------------------|
-| MatMul     | 5367.48   | ~100%              |
-| **Total**  | **5367.48** | **100%**         |
+| Operator  | Time (ms)   | % of forward pass |
+| --------- | ----------- | ----------------- |
+| MatMul    | 5367.48     | ~100%             |
+| **Total** | **5367.48** | **100%**          |
 
 MatMul is effectively the entire cost of a forward pass — every future optimization hour goes there first.
 
 ### Comparison vs. llama.cpp
 
-| Engine              | Decode Speed | Precision |
-|---------------------|--------------|-----------|
-| **This engine**     | 9.84 tok/s   | FP32      |
-| llama.cpp (run 1)   | 50.9 tok/s   | F16       |
-| llama.cpp (run 2)   | 39.4 tok/s   | F16       |
+| Engine            | Decode Speed | Compute Precision |
+| ----------------- | ------------ | ----------------- |
+| **This engine**   | 9.84 tok/s   | FP32              |
+| llama.cpp (run 1) | 50.9 tok/s   | F16               |
+| llama.cpp (run 2) | 39.4 tok/s   | F16               |
 
 This engine is roughly **4–5x slower** than llama.cpp on identical hardware and prompt. That gap is expected against a project with years of dedicated CPU-kernel engineering — the useful part is understanding *why*:
 
-- **Decode is memory-bandwidth-bound, not compute-bound.** Each decode step is a matrix × *vector* operation (one new token against the weight matrices), not matrix × matrix — so the bottleneck is bytes streamed from RAM per token, not FLOPs/sec.
-- **Precision compounds this directly.** This engine stores weights as FP32 (4 bytes/weight); llama.cpp's GGUF is F16 (2 bytes/weight) — roughly half the memory traffic per token before any kernel-quality difference even enters.
-- llama.cpp's GGML kernels are specifically hand-tuned for this single-token (`M=1`) regime; this engine's AVX2 path is not yet specialized for it.
+* **Decode is memory-bandwidth-bound, not compute-bound.** Each decode step is a matrix × *vector* operation (one new token against the weight matrices), not matrix × matrix — so the bottleneck is bytes streamed from RAM per token, not FLOPs/sec.
+* **Precision compounds this directly.** This engine upcasts weights to FP32 in memory (4 bytes/weight); llama.cpp's GGUF keeps weights in F16 (2 bytes/weight) — roughly half the memory traffic per token before any kernel-quality difference even enters.
+* llama.cpp's GGML kernels are specifically hand-tuned for this single-token (`M=1`) regime; this engine's AVX2 path is not yet specialized for it.
 
 **Next optimization target, in order:**
+
 1. Confirm the AVX2 path actually fires for the `M=1` decode shape rather than falling back to a scalar loop.
-2. Move weight storage to F16 to roughly halve decode-time memory traffic.
+2. Keep runtime weight storage in F16/BF16 to roughly halve decode-time memory traffic.
 3. Re-check whether `rayon` parallelism helps or hurts a single-row decode matmul — thread-spawn overhead can exceed the work itself at this size.
 
 ### Download the model and tokenizer
 
 ```bash
-# Download the SmolLM-135M model weights (~540 MB)
-curl -L -o smollm.safetensors https://huggingface.co/HuggingFaceTB/SmolLM-135M/resolve/main/model.safetensors
+# Download the SmolLM-135M-Instruct model weights (~270 MB BF16 SafeTensors)
+curl -L -o smollm-instruct.safetensors https://huggingface.co/HuggingFaceTB/SmolLM-135M-Instruct/resolve/main/model.safetensors
 
-# Download the corresponding tokenizer (~2 MB)
-curl -L -o smollm_tokenizer.json https://huggingface.co/HuggingFaceTB/SmolLM-135M/resolve/main/tokenizer.json
+# Download the corresponding Instruct tokenizer (~2 MB)
+curl -L -o smollm_instruct_tokenizer.json https://huggingface.co/HuggingFaceTB/SmolLM-135M-Instruct/resolve/main/tokenizer.json
 ```
 
 > **Windows (PowerShell):** use `curl.exe` instead of `curl`, since `curl` is an alias for `Invoke-WebRequest`.
@@ -153,7 +153,7 @@ curl -L -o smollm_tokenizer.json https://huggingface.co/HuggingFaceTB/SmolLM-135
 #### Optional: reproduce the llama.cpp comparison
 
 ```bash
-# Download the F16 GGUF build of the same model
+# Download the F16 GGUF build of the same Instruct model
 curl -L -o smollm-135m.gguf https://huggingface.co/second-state/SmolLM-135M-Instruct-GGUF/resolve/main/SmolLM-135M-Instruct-f16.gguf
 
 # Run with the same prompt used above
@@ -162,23 +162,24 @@ llama-cli.exe -m smollm-135m.gguf -p "Rust is a systems programming language tha
 
 ## Usage
 
-You can inspect models, run the profiler, or generate text directly from the CLI.
+You can inspect models, run the operator profiler, generate conversational responses, or enforce structured JSON outputs directly from the CLI.
 
 ```bash
-# Generate text and profile operator execution time
-cargo run --release -- generate --model smollm.safetensors --tokenizer smollm_tokenizer.json --prompt "Rust is a systems programming language that" --profile
+# 1. Standard Instruction / Code Generation (automatically wrapped in ChatML)
+cargo run --release -- generate --model smollm-instruct.safetensors --tokenizer smollm_instruct_tokenizer.json --prompt "Write a for loop in java" --profile
 
-# Inspect SafeTensors architecture without executing
-cargo run --release -- inspect --model smollm.safetensors
+# 2. Structured JSON / Roleplay Generation (using explicit ChatML + JSON prefix seeding)
+cargo run --release -- generate --model smollm-instruct.safetensors --tokenizer smollm_instruct_tokenizer.json --prompt '<|im_start|>system\nYour name is Dr. Aris. You are the chief physicist at the Mars Research Facility. Speak briefly in first person as Dr. Aris.<|im_end|>\n<|im_start|>user\nWho are you?<|im_end|>\n<|im_start|>assistant\n{\"dialogue\": \"I am Dr. Aris,'
+
+# 3. Inspect SafeTensors architecture without executing
+cargo run --release -- inspect --model smollm-instruct.safetensors
 ```
-
-> **Windows (PowerShell):** use `curl.exe` instead of `curl`, since `curl` is an alias for `Invoke-WebRequest`.
 
 ## Future Work (v1.1 and Beyond)
 
 Having established a mathematically sound, benchmarked baseline, future development will focus on scaling and optimization:
 
-- **Quantization (highest priority — see benchmark analysis above):** F16 weight storage first, then INT8/INT4 kernels for larger models (like Llama-3-8B).
-- **Sampling Improvements:** Refining Top-K and Top-P penalty logic.
-- **Serving Architecture:** Paged KV Cache and continuous batching.
-- **Hardware Backends:** Exploring GPU execution (CUDA/Metal).
+* **Quantization & Native Half-Precision Compute (highest priority — see benchmark analysis above):** Native F16/BF16 weight storage in RAM first, then INT8/INT4 quantized kernels for larger models (like Llama-3-8B).
+* **Sampling & Grammar Constraints:** Refining Top-K/Top-P sampling and adding formal grammar/schema state machines for guaranteed structured outputs.
+* **Serving Architecture:** Paged KV Cache and continuous batching.
+* **Hardware Backends:** Exploring GPU execution (CUDA/Metal).

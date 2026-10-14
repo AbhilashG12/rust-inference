@@ -15,7 +15,7 @@ impl Default for GenerationConfig {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
-            max_tokens: 50,
+            max_tokens: 200,
             repetition_penalty: 1.2,
         }
     }
@@ -31,7 +31,7 @@ impl Sampler {
         // 0. REPETITION PENALTY
         if config.repetition_penalty > 1.0 {
             let mut seen = HashSet::new();
-            for &token in history {
+            for &token in history.iter().rev().take(20) {
                 seen.insert(token as usize);
             }
             

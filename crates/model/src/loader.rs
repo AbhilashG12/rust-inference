@@ -29,14 +29,42 @@ impl ModelLoader {
         for name in st.names() {
             let tensor_view = st.tensor(&name)?;
             let shape = tensor_view.shape().to_vec();
-            let data: Vec<f32> = tensor_view
-                .data()
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let array: [u8; 4] = chunk.try_into().unwrap();
-                    f32::from_le_bytes(array)
-                })
-                .collect();
+            let data: Vec<f32> = match tensor_view.dtype() {
+                safetensors::Dtype::F32 => tensor_view
+                    .data()
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect(),
+                safetensors::Dtype::BF16 => tensor_view
+                    .data()
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        // BF16 is just the upper 16 bits of an IEEE 754 F32!
+                        let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+                        f32::from_bits((bits as u32) << 16)
+                    })
+                    .collect(),
+                safetensors::Dtype::F16 => tensor_view
+                    .data()
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        // Simple IEEE 754 FP16 to FP32 conversion if needed
+                        let bits = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
+                        let sign = (bits & 0x8000) << 16;
+                        let exp = (bits & 0x7c00) >> 10;
+                        let mant = bits & 0x03ff;
+                        let f32_bits = if exp == 0 {
+                            sign
+                        } else if exp == 31 {
+                            sign | 0x7f800000 | (mant << 13)
+                        } else {
+                            sign | ((exp + 112) << 23) | (mant << 13)
+                        };
+                        f32::from_bits(f32_bits)
+                    })
+                    .collect(),
+                other => panic!("Unsupported dtype in safetensors: {:?}", other),
+            };
             let mut my_tensor = Tensor::new(data, shape).map_err(|_| LoaderError::EngineError)?;
             if my_tensor.shape.rank() == 2 && !name.contains("embed") {
                 let transposed = my_tensor.transpose_2d().map_err(|_| LoaderError::EngineError)?;

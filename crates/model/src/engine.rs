@@ -95,7 +95,16 @@ impl LlmEngine {
     }
 
     pub fn generate(&self, prompt: &str, config: GenerationConfig) {
-        let mut tokens = self.tokenizer.encode(prompt);
+        let formatted_prompt = if prompt.contains("<|im_start|>") {
+            prompt.to_string()
+        } else {
+            format!(
+                "<|im_start|>system\nYou are a helpful, concise programming and AI assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                prompt
+            )
+        };
+
+        let mut tokens = self.tokenizer.encode(&formatted_prompt);
         let num_layers = self.blocks.len();
         let mut kv_cache = KVCache::new(num_layers); // Initialize cache for ALL layers
         
@@ -132,6 +141,11 @@ impl LlmEngine {
 
         // 2. DECODE PHASE
         for _ in 0..config.max_tokens {
+            let last_word = self.tokenizer.decode(*tokens.last().unwrap());
+            if formatted_prompt.contains("{\"dialogue\":") && last_word.contains('}') {
+                break;
+            }
+
             let token_id = *tokens.last().unwrap();
             let pos = tokens.len() - 1; 
             
@@ -147,7 +161,10 @@ impl LlmEngine {
             
             let next_token = Sampler::sample(&logits, &config,&tokens);
             let next_word = self.tokenizer.decode(next_token);
-            
+           if next_token == 0 || next_token == 2 || next_word.contains("<|im_end|>") || next_word.contains("<|endoftext|>") {
+                break;
+            }
+
             print!("{}", next_word);
             io::stdout().flush().unwrap();
             tokens.push(next_token);

@@ -19,7 +19,8 @@ impl Tokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let encoding = self.engine.encode(text, false).unwrap();
+        let formatted_text = text.replace("\\n", "\n");
+        let encoding = self.engine.encode(formatted_text.as_str(), true).unwrap();
         encoding.get_ids().to_vec()
     }
 
