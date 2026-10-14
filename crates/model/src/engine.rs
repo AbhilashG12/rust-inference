@@ -7,6 +7,15 @@ use tensor::cache::KVCache;
 use std::io::{self, Write};
 use std::time::Instant;
 
+pub struct GenerationOutput {
+    pub text: String,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub ttft_ms: u64,
+    pub total_latency_ms: u64,
+    pub kv_memory_mb: f32,
+}
+
 pub struct LlmEngine {
     tokenizer: Tokenizer,
     embedding: Embedding,
@@ -16,6 +25,84 @@ pub struct LlmEngine {
 }
 
 impl LlmEngine {
+    pub fn generate_for_api(&self, prompt: &str, config: GenerationConfig) -> GenerationOutput {
+        let mut tokens = self.tokenizer.encode(prompt);
+        let prompt_len = tokens.len();
+        let num_layers = self.blocks.len();
+        let mut kv_cache = KVCache::new(num_layers);
+        
+        let start_time = Instant::now();
+        let mut ttft_ms = 0;
+        let mut generated_count = 0;
+        let mut output_text = String::new();
+
+        // 1. PREFILL PHASE
+        for pos in 0..prompt_len {
+            let token_id = tokens[pos];
+            let mut hidden_state = self.embedding.forward(token_id as usize);
+            
+            for (i, block) in self.blocks.iter().enumerate() {
+                hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
+            }
+            
+            if pos == prompt_len - 1 {
+                hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
+                let logits = self.lm_head.forward(&hidden_state).unwrap();
+                let next_token = Sampler::sample(&logits, &config, &tokens);
+                let next_word = self.tokenizer.decode(next_token);
+                
+                ttft_ms = start_time.elapsed().as_millis() as u64;
+                output_text.push_str(&next_word);
+                tokens.push(next_token);
+                generated_count += 1;
+            }
+        }
+
+        // 2. DECODE PHASE
+        for _ in 0..config.max_tokens {
+            // Stop immediately as soon as the JSON object closes with '}'
+            if output_text.contains('}') {
+                break;
+            }
+
+            let token_id = *tokens.last().unwrap();
+            let pos = tokens.len() - 1;
+            
+            let mut hidden_state = self.embedding.forward(token_id as usize);
+            
+            for (i, block) in self.blocks.iter().enumerate() {
+                hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
+            }
+            
+            hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
+            let logits = self.lm_head.forward(&hidden_state).unwrap();
+            
+            let next_token = Sampler::sample(&logits, &config, &tokens);
+            let next_word = self.tokenizer.decode(next_token);
+            
+            if next_token == 0 || next_token == 2 || next_word.contains("<|im_end|>") || next_word.contains("<|endoftext|>") {
+                break;
+            }
+            
+            output_text.push_str(&next_word);
+            tokens.push(next_token);
+            generated_count += 1;
+        }
+
+        let hidden_dim = self.final_norm.shape.dims()[0];
+        let bytes_per_token = 2 * num_layers * hidden_dim * 4;
+        let total_kv_mb = (bytes_per_token * tokens.len()) as f32 / (1024.0 * 1024.0);
+
+        GenerationOutput {
+            text: output_text,
+            prompt_tokens: prompt_len,
+            completion_tokens: generated_count,
+            ttft_ms,
+            total_latency_ms: start_time.elapsed().as_millis() as u64,
+            kv_memory_mb: total_kv_mb,
+        }
+    }
+
     pub fn load(model_path: &str, tokenizer_path: &str) -> Self {
         println!(" Loading model weights into RAM (this may take a few seconds)...");
         let weights = ModelLoader::load_safetensors(model_path).expect("Failed to load model");
