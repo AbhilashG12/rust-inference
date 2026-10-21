@@ -25,6 +25,97 @@ pub struct LlmEngine {
 }
 
 impl LlmEngine {
+    
+    pub fn generate_streaming<F>(&self, prompt: &str, config: GenerationConfig, mut on_token: F) -> GenerationOutput 
+    where
+        F: FnMut(&str)
+    {
+        let mut tokens = self.tokenizer.encode(prompt);
+        let prompt_len = tokens.len();
+        let num_layers = self.blocks.len();
+        let mut kv_cache = KVCache::new(num_layers);
+        
+        let start_time = std::time::Instant::now();
+        let mut ttft_ms = 0;
+        let mut generated_count = 0;
+        let mut output_text = String::new();
+
+        if prompt_len == 0 {
+            return GenerationOutput { text: String::new(), prompt_tokens: 0, completion_tokens: 0, ttft_ms: 0, total_latency_ms: 0, kv_memory_mb: 0.0 };
+        }
+
+        // 1. PREFILL PHASE
+        for pos in 0..prompt_len {
+            let token_id = tokens[pos];
+            let mut hidden_state = self.embedding.forward(token_id as usize);
+            
+            for (i, block) in self.blocks.iter().enumerate() {
+                hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
+            }
+            
+            if pos == prompt_len - 1 {
+                hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
+                let logits = self.lm_head.forward(&hidden_state).unwrap();
+                let next_token = Sampler::sample(&logits, &config, &tokens);
+                let next_word = self.tokenizer.decode(next_token);
+                
+                ttft_ms = start_time.elapsed().as_millis() as u64;
+                if next_token != 0 && next_token != 2 && !next_word.contains("<|im_end|>") {
+                    output_text.push_str(&next_word);
+                    on_token(&next_word); // Stream token immediately!
+                    tokens.push(next_token);
+                    generated_count += 1;
+                }
+            }
+        }
+
+        // 2. DECODE PHASE
+        for _ in 0..config.max_tokens {
+            if output_text.trim().len() > 20 && (output_text.contains('\n') || output_text.contains('"')) {
+                break;
+            }
+
+            let token_id = *tokens.last().unwrap();
+            let pos = tokens.len() - 1;
+            
+            let mut hidden_state = self.embedding.forward(token_id as usize);
+            
+            for (i, block) in self.blocks.iter().enumerate() {
+                hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
+            }
+            
+            hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
+            let logits = self.lm_head.forward(&hidden_state).unwrap();
+            
+            let next_token = Sampler::sample(&logits, &config, &tokens);
+            let next_word = self.tokenizer.decode(next_token);
+            
+            if next_token == 0 || next_token == 2 || next_word.contains("<|im_end|>") || next_word.contains("<|endoftext|>") {
+                break;
+            }
+            
+            output_text.push_str(&next_word);
+            on_token(&next_word); // Stream token immediately!
+            tokens.push(next_token);
+            generated_count += 1;
+        }
+
+        let hidden_dim = self.final_norm.shape.dims()[0];
+        let bytes_per_token = 2 * num_layers * hidden_dim * 4;
+        let total_kv_mb = (bytes_per_token * tokens.len()) as f32 / (1024.0 * 1024.0);
+
+        GenerationOutput {
+            text: output_text,
+            prompt_tokens: prompt_len,
+            completion_tokens: generated_count,
+            ttft_ms,
+            total_latency_ms: start_time.elapsed().as_millis() as u64,
+            kv_memory_mb: total_kv_mb,
+        }
+    }
+
+
+
     pub fn generate_for_api(&self, prompt: &str, config: GenerationConfig) -> GenerationOutput {
         let mut tokens = self.tokenizer.encode(prompt);
         let prompt_len = tokens.len();
@@ -276,90 +367,3 @@ impl LlmEngine {
     }
 }
 
-pub fn generate_streaming<F>(&self, prompt: &str, config: GenerationConfig, mut on_token: F) -> GenerationOutput 
-    where
-        F: FnMut(&str)
-    {
-        let mut tokens = self.tokenizer.encode(prompt);
-        let prompt_len = tokens.len();
-        let num_layers = self.blocks.len();
-        let mut kv_cache = KVCache::new(num_layers);
-        
-        let start_time = std::time::Instant::now();
-        let mut ttft_ms = 0;
-        let mut generated_count = 0;
-        let mut output_text = String::new();
-
-        if prompt_len == 0 {
-            return GenerationOutput { text: String::new(), prompt_tokens: 0, completion_tokens: 0, ttft_ms: 0, total_latency_ms: 0, kv_memory_mb: 0.0 };
-        }
-
-        // 1. PREFILL PHASE
-        for pos in 0..prompt_len {
-            let token_id = tokens[pos];
-            let mut hidden_state = self.embedding.forward(token_id as usize);
-            
-            for (i, block) in self.blocks.iter().enumerate() {
-                hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
-            }
-            
-            if pos == prompt_len - 1 {
-                hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
-                let logits = self.lm_head.forward(&hidden_state).unwrap();
-                let next_token = Sampler::sample(&logits, &config, &tokens);
-                let next_word = self.tokenizer.decode(next_token);
-                
-                ttft_ms = start_time.elapsed().as_millis() as u64;
-                if next_token != 0 && next_token != 2 && !next_word.contains("<|im_end|>") {
-                    output_text.push_str(&next_word);
-                    on_token(&next_word); // Stream token immediately!
-                    tokens.push(next_token);
-                    generated_count += 1;
-                }
-            }
-        }
-
-        // 2. DECODE PHASE
-        for _ in 0..config.max_tokens {
-            if output_text.trim().len() > 20 && (output_text.contains('\n') || output_text.contains('"')) {
-                break;
-            }
-
-            let token_id = *tokens.last().unwrap();
-            let pos = tokens.len() - 1;
-            
-            let mut hidden_state = self.embedding.forward(token_id as usize);
-            
-            for (i, block) in self.blocks.iter().enumerate() {
-                hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
-            }
-            
-            hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
-            let logits = self.lm_head.forward(&hidden_state).unwrap();
-            
-            let next_token = Sampler::sample(&logits, &config, &tokens);
-            let next_word = self.tokenizer.decode(next_token);
-            
-            if next_token == 0 || next_token == 2 || next_word.contains("<|im_end|>") || next_word.contains("<|endoftext|>") {
-                break;
-            }
-            
-            output_text.push_str(&next_word);
-            on_token(&next_word); // Stream token immediately!
-            tokens.push(next_token);
-            generated_count += 1;
-        }
-
-        let hidden_dim = self.final_norm.shape.dims()[0];
-        let bytes_per_token = 2 * num_layers * hidden_dim * 4;
-        let total_kv_mb = (bytes_per_token * tokens.len()) as f32 / (1024.0 * 1024.0);
-
-        GenerationOutput {
-            text: output_text,
-            prompt_tokens: prompt_len,
-            completion_tokens: generated_count,
-            ttft_ms,
-            total_latency_ms: start_time.elapsed().as_millis() as u64,
-            kv_memory_mb: total_kv_mb,
-        }
-    }
