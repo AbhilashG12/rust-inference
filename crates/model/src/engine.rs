@@ -41,7 +41,14 @@ impl LlmEngine {
         let mut output_text = String::new();
 
         if prompt_len == 0 {
-            return GenerationOutput { text: String::new(), prompt_tokens: 0, completion_tokens: 0, ttft_ms: 0, total_latency_ms: 0, kv_memory_mb: 0.0 };
+            return GenerationOutput {
+                text: String::new(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                ttft_ms: 0,
+                total_latency_ms: 0,
+                kv_memory_mb: 0.0,
+            };
         }
 
         // 1. PREFILL PHASE
@@ -62,7 +69,7 @@ impl LlmEngine {
                 ttft_ms = start_time.elapsed().as_millis() as u64;
                 if next_token != 0 && next_token != 2 && !next_word.contains("<|im_end|>") {
                     output_text.push_str(&next_word);
-                    on_token(&next_word); // Stream token immediately!
+                    on_token(&next_word);
                     tokens.push(next_token);
                     generated_count += 1;
                 }
@@ -70,8 +77,17 @@ impl LlmEngine {
         }
 
         // 2. DECODE PHASE
-        for _ in 0..config.max_tokens {
-            if output_text.trim().len() > 20 && (output_text.contains('\n') || output_text.contains('"')) {
+        for step in 0..config.max_tokens {
+            let trimmed = output_text.trim();
+
+            // Stop if the model finishes a paragraph with a newline
+            if trimmed.len() > 25 && output_text.contains('\n') {
+                break;
+            }
+
+            // Once we have generated at least 35 tokens (~1-2 sentences), stop cleanly at the next sentence boundary
+            // so the NPC never gets cut off mid-sentence!
+            if step >= 35 && (trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?')) {
                 break;
             }
 
@@ -95,7 +111,7 @@ impl LlmEngine {
             }
             
             output_text.push_str(&next_word);
-            on_token(&next_word); // Stream token immediately!
+            on_token(&next_word);
             tokens.push(next_token);
             generated_count += 1;
         }
@@ -113,8 +129,6 @@ impl LlmEngine {
             kv_memory_mb: total_kv_mb,
         }
     }
-
-
 
     pub fn generate_for_api(&self, prompt: &str, config: GenerationConfig) -> GenerationOutput {
         let mut tokens = self.tokenizer.encode(prompt);
