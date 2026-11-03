@@ -34,7 +34,7 @@ impl Sampler {
             for &token in history.iter().rev().take(20) {
                 seen.insert(token as usize);
             }
-            
+
             for idx in seen {
                 if idx < vocab_size {
                     let logit = data[idx];
@@ -53,12 +53,16 @@ impl Sampler {
             let mut max_idx = 0;
             let mut max_val = f32::NEG_INFINITY;
             for (i, &val) in data.iter().enumerate() {
-                if val > max_val { max_val = val; max_idx = i; }
+                if val > max_val {
+                    max_val = val;
+                    max_idx = i;
+                }
             }
             return max_idx as u32;
         }
 
-        let mut temp_scaled: Vec<(usize, f32)> = data.iter()
+        let mut temp_scaled: Vec<(usize, f32)> = data
+            .iter()
             .enumerate()
             .map(|(i, &val)| (i, val / config.temperature))
             .collect();
@@ -71,7 +75,7 @@ impl Sampler {
         let max_logit = temp_scaled[0].1;
         let mut sum_exp = 0.0;
         let mut probs = Vec::with_capacity(temp_scaled.len());
-        
+
         for &(idx, val) in &temp_scaled {
             let exp_val = (val - max_logit).exp();
             probs.push((idx, exp_val));
@@ -80,12 +84,12 @@ impl Sampler {
 
         let mut cumulative_prob = 0.0;
         let mut final_candidates = Vec::new();
-        
+
         for (idx, exp_val) in probs {
             let prob = exp_val / sum_exp;
             cumulative_prob += prob;
             final_candidates.push((idx, prob));
-            
+
             if cumulative_prob >= config.top_p {
                 break;
             }

@@ -20,9 +20,8 @@ impl GraphOptimizer {
 
                 if n1.op == Operator::MatMul && n2.op == Operator::Add && n3.op == Operator::Relu {
                     if n1.outputs[0] == n2.inputs[0] && n2.outputs[0] == n3.inputs[0] {
-                        
                         println!("🔧 Optimizer: Fusing MatMul + Add + ReLU");
-                        
+
                         let fused_node = Node {
                             id: NodeId(optimized_nodes.len()),
                             op: Operator::FusedMatMulAddRelu,
@@ -30,7 +29,7 @@ impl GraphOptimizer {
                             outputs: vec![n3.outputs[0]],
                         };
                         optimized_nodes.push(fused_node);
-                        
+
                         skip_next = 2;
                         continue;
                     }

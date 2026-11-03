@@ -3,6 +3,7 @@ use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs::File;
 use tensor::tensor::Tensor;
+use tensor::quant::QuantizedTensorQ8_0;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -15,15 +16,19 @@ pub enum LoaderError {
     EngineError,
 }
 
+pub enum LoadedWeight {
+    Fp32(Tensor),
+    Q8(QuantizedTensorQ8_0),
+}
+
 pub struct ModelLoader;
 
 impl ModelLoader {
-    pub fn load_safetensors(path: &str) -> Result<HashMap<String, Tensor>, LoaderError> {
+    pub fn load_safetensors(path: &str) -> Result<HashMap<String, LoadedWeight>, LoaderError> {
         let file = File::open(path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         let st = SafeTensors::deserialize(&mmap)?;
-
         let mut tensors = HashMap::new();
 
         for name in st.names() {
@@ -39,7 +44,6 @@ impl ModelLoader {
                     .data()
                     .chunks_exact(2)
                     .map(|chunk| {
-                        // BF16 is just the upper 16 bits of an IEEE 754 F32!
                         let bits = u16::from_le_bytes(chunk.try_into().unwrap());
                         f32::from_bits((bits as u32) << 16)
                     })
@@ -48,7 +52,6 @@ impl ModelLoader {
                     .data()
                     .chunks_exact(2)
                     .map(|chunk| {
-                        // Simple IEEE 754 FP16 to FP32 conversion if needed
                         let bits = u16::from_le_bytes(chunk.try_into().unwrap()) as u32;
                         let sign = (bits & 0x8000) << 16;
                         let exp = (bits & 0x7c00) >> 10;
@@ -65,22 +68,16 @@ impl ModelLoader {
                     .collect(),
                 other => panic!("Unsupported dtype in safetensors: {:?}", other),
             };
-            let mut my_tensor = Tensor::new(data, shape).map_err(|_| LoaderError::EngineError)?;
-            if my_tensor.shape.rank() == 2 && !name.contains("embed") {
-                let transposed = my_tensor.transpose_2d().map_err(|_| LoaderError::EngineError)?;
-                let rows = transposed.shape.dims()[0];
-                let cols = transposed.shape.dims()[1];
-                let mut contiguous_data = Vec::with_capacity(rows * cols);
-                
-                for r in 0..rows {
-                    for c in 0..cols {
-                        let idx = r * transposed.strides[0] + c * transposed.strides[1];
-                        contiguous_data.push(transposed.data[idx]);
-                    }
-                }
-                my_tensor = Tensor::new(contiguous_data, vec![rows, cols]).map_err(|_| LoaderError::EngineError)?;
+
+            let raw_tensor = Tensor::new(data, shape).map_err(|_| LoaderError::EngineError)?;
+
+            // Do NOT transpose here anymore! Keep native [out, in] layout for SIMD vector math!
+            if raw_tensor.shape.rank() == 2 && !name.contains("embed") {
+                let quantized_tensor = QuantizedTensorQ8_0::quantize(&raw_tensor);
+                tensors.insert(name.to_string(), LoadedWeight::Q8(quantized_tensor));
+            } else {
+                tensors.insert(name.to_string(), LoadedWeight::Fp32(raw_tensor));
             }
-            tensors.insert(name.to_string(), my_tensor);
         }
 
         Ok(tensors)

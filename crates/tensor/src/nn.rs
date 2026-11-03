@@ -1,5 +1,6 @@
 use crate::cache::KVCache;
 use crate::error::Result;
+use crate::quant::QuantizedTensorQ8_0;
 use crate::tensor::Tensor;
 
 pub struct Embedding {
@@ -7,7 +8,7 @@ pub struct Embedding {
 }
 
 pub struct Linear {
-    pub weight: Tensor,
+    pub weight: QuantizedTensorQ8_0, // Now stores compressed 8-bit blocks!
     pub bias: Tensor,
 }
 
@@ -56,11 +57,11 @@ impl TransformerBlock {
         let gate = self.ffn_gate.forward(&norm_res_1)?;
         let activated_gate = gate.silu();
         let up = self.ffn_up.forward(&norm_res_1)?;
-    
+
         let hidden = activated_gate.mul(&up)?;
-        
+
         let ffn_out = self.ffn_down.forward(&hidden)?;
-        
+
         let final_out = residual_1.add(&ffn_out)?;
         Ok(final_out)
     }
@@ -80,14 +81,23 @@ impl Embedding {
 }
 
 impl Linear {
-    pub fn new(weight: Tensor, bias: Tensor) -> Self {
+    pub fn new(weight: QuantizedTensorQ8_0, bias: Tensor) -> Self {
         Self { weight, bias }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = x.matmul(&self.weight)?;
-        let out_with_bias = out.add_broadcast_1d(&self.bias)?;
+        let seq_len = x.shape.dims()[0];
 
+        let out = if seq_len == 1 {
+            // M=1 Decode Phase: Route to lightning-fast Q8 SIMD kernel
+            self.weight.vec_mat_mul(x)?
+        } else {
+            // Prefill Phase: Dequantize locally to run standard dense GEMM
+            let fp32_weight = self.weight.dequantize();
+            x.matmul(&fp32_weight)?
+        };
+
+        let out_with_bias = out.add_broadcast_1d(&self.bias)?;
         Ok(out_with_bias)
     }
 }

@@ -3,11 +3,11 @@ pub mod error;
 pub mod kernels;
 pub mod nn;
 pub mod ops;
+pub mod profiler;
 pub mod quant;
 pub mod sampler;
 pub mod shape;
 pub mod tensor;
-pub mod profiler;
 
 #[cfg(test)]
 mod tests {
@@ -93,10 +93,10 @@ mod phase2_tests {
 #[cfg(test)]
 mod transformer_tests {
     // use super::*;
+    use crate::cache::KVCache;
     use crate::nn::{Linear, TransformerBlock};
     use crate::quant::QuantizedTensor;
     use crate::tensor::Tensor;
-    use crate::cache::KVCache;
 
     #[test]
     fn test_transformer_and_quantization() {

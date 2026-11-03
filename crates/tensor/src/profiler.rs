@@ -19,7 +19,10 @@ impl Profiler {
     }
 
     pub fn record(&mut self, name: &str, duration: Duration) {
-        let entry = self.metrics.entry(name.to_string()).or_insert(Duration::new(0, 0));
+        let entry = self
+            .metrics
+            .entry(name.to_string())
+            .or_insert(Duration::new(0, 0));
         *entry += duration;
     }
 
@@ -27,7 +30,7 @@ impl Profiler {
         println!("\n📊 Operator Profiling Summary:");
         println!("{:<20} | {}", "Operator", "Time (ms)");
         println!("{:-<20}-+-{:-<15}", "", "");
-        
+
         let mut total_ms = 0.0;
         let mut sorted_metrics: Vec<_> = self.metrics.iter().collect();
         // Sort by longest duration first
@@ -41,7 +44,7 @@ impl Profiler {
         println!("{:-<20}-+-{:-<15}", "", "");
         println!("{:<20} | {:.2} ms", "TOTAL", total_ms);
     }
-    
+
     pub fn reset(&mut self) {
         self.metrics.clear();
     }

@@ -25,7 +25,7 @@ impl Runtime {
                     let input = &plan.graph.tensors[node.inputs[0].0];
                     let weight = &plan.graph.tensors[node.inputs[1].0];
                     let bias = &plan.graph.tensors[node.inputs[2].0];
-                    
+
                     let result = input.fused_matmul_add_relu(weight, bias)?;
                     plan.graph.tensors[node.outputs[0].0] = result;
                 }
@@ -36,7 +36,7 @@ impl Runtime {
                 if let Some(count) = live_counts.get_mut(input_id) {
                     *count -= 1;
                     if *count == 0 {
-                        // In a fully developed engine, we would return `input_id`'s 
+                        // In a fully developed engine, we would return `input_id`'s
                         // backing byte-buffer to an Arena for the next node to overwrite.
                         // For now, we logically mark it dead.
                         // println!("♻️ Tensor {:?} is dead. Buffer ready for reuse.", input_id);
@@ -47,7 +47,6 @@ impl Runtime {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -72,8 +71,8 @@ mod tests {
         assert_eq!(naive_graph.nodes.len(), 3); // Naive graph has 3 steps
 
         let optimized_graph = GraphOptimizer::optimize(naive_graph);
-        
-        assert_eq!(optimized_graph.nodes.len(), 1); 
+
+        assert_eq!(optimized_graph.nodes.len(), 1);
         assert_eq!(optimized_graph.nodes[0].op, Operator::FusedMatMulAddRelu);
 
         let mem_plan = MemoryPlanner::plan(&optimized_graph);
@@ -84,7 +83,7 @@ mod tests {
         };
 
         Runtime::execute(&mut plan).unwrap();
-        
+
         println!(" Phase 4 Pipeline Complete!");
     }
 }

@@ -1,5 +1,5 @@
 use crate::ir::{Graph, TensorId};
-use std::collections::{HashMap};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct MemoryPlan {

@@ -1,6 +1,6 @@
 use crate::ir::{Graph, Node, NodeId, Operator, TensorId};
-use tensor::tensor::Tensor;
 use tensor::error::{Result, TensorError};
+use tensor::tensor::Tensor;
 
 pub struct GraphBuilder {
     graph: Graph,
@@ -28,7 +28,6 @@ impl GraphBuilder {
         let tensor = Tensor::zeroes(shape);
         self.add_tensor(tensor)
     }
-
 
     pub fn matmul(&mut self, a: TensorId, b: TensorId) -> Result<TensorId> {
         let shape_a = self.graph.tensors[a.0].shape.dims();
@@ -66,7 +65,7 @@ impl GraphBuilder {
         }
 
         let out_id = self.allocate_output(shape_target.to_vec());
-        
+
         self.graph.nodes.push(Node {
             id: NodeId(self.graph.nodes.len()),
             op: Operator::Add,
@@ -112,20 +111,18 @@ mod tests {
         let mut builder = GraphBuilder::new();
 
         let input = Tensor::new(vec![1.0, 2.0, -1.0], vec![1, 3]).unwrap();
-        
-        let l1_weight = Tensor::new(vec![
-            0.1,  0.2, -0.1,  0.3,
-           -0.2,  0.1,  0.5, -0.1,
-            0.3, -0.4,  0.2,  0.1
-        ], vec![3, 4]).unwrap();
+
+        let l1_weight = Tensor::new(
+            vec![
+                0.1, 0.2, -0.1, 0.3, -0.2, 0.1, 0.5, -0.1, 0.3, -0.4, 0.2, 0.1,
+            ],
+            vec![3, 4],
+        )
+        .unwrap();
         let l1_bias = Tensor::new(vec![0.1, -0.1, 0.2, 0.0], vec![4]).unwrap();
-        
-        let l2_weight = Tensor::new(vec![
-            0.5, -0.2,
-           -0.3,  0.1,
-            0.2,  0.4,
-           -0.1,  0.3
-        ], vec![4, 2]).unwrap();
+
+        let l2_weight =
+            Tensor::new(vec![0.5, -0.2, -0.3, 0.1, 0.2, 0.4, -0.1, 0.3], vec![4, 2]).unwrap();
         let l2_bias = Tensor::new(vec![0.05, -0.05], vec![2]).unwrap();
 
         //  Add raw data to the Graph Arena
@@ -139,7 +136,7 @@ mod tests {
         let x = builder.matmul(input_id, w1_id).expect("L1 MatMul failed");
         let x = builder.add_broadcast(x, b1_id).expect("L1 Bias failed");
         let x = builder.relu(x).expect("ReLU failed");
-        
+
         let x = builder.matmul(x, w2_id).expect("L2 MatMul failed");
         let logits_id = builder.add_broadcast(x, b2_id).expect("L2 Bias failed");
 
@@ -167,16 +164,19 @@ mod tests {
     #[test]
     fn test_shape_inference_catches_errors() {
         let mut builder = GraphBuilder::new();
-        
+
         // Mismatched shapes: [1, 3] trying to MatMul with [4, 2]
         let input = Tensor::zeroes(vec![1, 3]);
         let weight = Tensor::zeroes(vec![4, 2]); // Should be [3, 2]
-        
+
         let in_id = builder.add_tensor(input);
         let w_id = builder.add_tensor(weight);
 
         // The builder should reject this immediately, BEFORE execution
         let result = builder.matmul(in_id, w_id);
-        assert!(result.is_err(), "Graph Builder failed to catch shape mismatch!");
+        assert!(
+            result.is_err(),
+            "Graph Builder failed to catch shape mismatch!"
+        );
     }
 }

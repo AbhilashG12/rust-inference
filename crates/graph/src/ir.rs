@@ -6,7 +6,7 @@ pub struct TensorId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub usize);
 
-#[derive(Debug,Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
     MatMul,
     Add,
@@ -17,16 +17,16 @@ pub enum Operator {
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub id : NodeId,
-    pub op : Operator,
-    pub inputs : Vec<TensorId>,
-    pub outputs : Vec<TensorId>,
+    pub id: NodeId,
+    pub op: Operator,
+    pub inputs: Vec<TensorId>,
+    pub outputs: Vec<TensorId>,
 }
 
 #[derive(Debug)]
 pub struct Graph {
-    pub nodes : Vec<Node>,
-    pub tensors : Vec<Tensor>,
-    pub network_inputs : Vec<TensorId>,
-    pub network_outputs : Vec<TensorId>,
+    pub nodes: Vec<Node>,
+    pub tensors: Vec<Tensor>,
+    pub network_inputs: Vec<TensorId>,
+    pub network_outputs: Vec<TensorId>,
 }

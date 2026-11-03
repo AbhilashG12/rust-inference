@@ -4,8 +4,7 @@ use tensor::error::Result;
 pub struct Executor;
 
 impl Executor {
-
-    pub fn run(graph:&mut Graph) -> Result<()> {
+    pub fn run(graph: &mut Graph) -> Result<()> {
         for node in &graph.nodes {
             match node.op {
                 Operator::MatMul => {
@@ -31,7 +30,9 @@ impl Executor {
                     graph.tensors[node.outputs[0].0] = result;
                 }
                 Operator::FusedMatMulAddRelu => {
-                    unimplemented!("Fused operators should be run by the Phase 4 Runtime, not the naive Executor!");
+                    unimplemented!(
+                        "Fused operators should be run by the Phase 4 Runtime, not the naive Executor!"
+                    );
                 }
             }
         }
