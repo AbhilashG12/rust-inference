@@ -39,16 +39,15 @@ impl TransformerBlock {
         let mut k = self.w_k.forward(&norm_x)?;
         let mut v = self.w_v.forward(&norm_x)?;
 
-        let q_dim = *q.shape.dims().last().unwrap();
-        k = k.repeat_features(q_dim)?;
-        v = v.repeat_features(q_dim)?;
-
+        // Notice: `repeat_features` is entirely deleted!
         q = q.apply_rope(pos);
         k = k.apply_rope(pos);
 
-        let (full_k, full_v) = kv_cache.update(layer_idx, &k, &v);
+        // Map the new token straight into the continuous buffer
+        kv_cache.append(layer_idx, &k, &v);
 
-        let attn_out = Tensor::attention(&q, &full_k, &full_v)?;
+        // Extract attention scores reading natively from the flat array memory
+        let attn_out = Tensor::attention_kv_cached(&q, layer_idx, kv_cache)?;
 
         let proj_out = self.w_o.forward(&attn_out)?;
         let residual_1 = x.add(&proj_out)?;
@@ -57,12 +56,11 @@ impl TransformerBlock {
         let gate = self.ffn_gate.forward(&norm_res_1)?;
         let activated_gate = gate.silu();
         let up = self.ffn_up.forward(&norm_res_1)?;
-
+    
         let hidden = activated_gate.mul(&up)?;
-
         let ffn_out = self.ffn_down.forward(&hidden)?;
-
         let final_out = residual_1.add(&ffn_out)?;
+        
         Ok(final_out)
     }
 }

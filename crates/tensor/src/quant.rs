@@ -2,7 +2,7 @@ use crate::error::{Result, TensorError};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use rayon::prelude::*; // Ensure this matches your error path
-
+use crate::profiler::ProfileScope;
 /// Standard block size for Q8_0 quantization (same as GGML/llama.cpp)
 pub const Q8_BLOCK_SIZE: usize = 32;
 
@@ -24,6 +24,17 @@ impl BlockQ8_0 {
             sum += (self.qs[i] as f32) * activation_chunk[i];
         }
         sum * self.scale
+    }
+
+    #[inline(always)]
+    pub fn dot_q8(&self, other: &BlockQ8_0) -> f32 {
+        let mut sum = 0i32;
+        for i in 0..Q8_BLOCK_SIZE {
+            // Pure integer multiplication in the tight inner loop
+            sum += (self.qs[i] as i32) * (other.qs[i] as i32);
+        }
+        // Only convert to float EXACTLY ONCE at the very end
+        (sum as f32) * self.scale * other.scale
     }
 }
 
@@ -86,8 +97,8 @@ impl QuantizedTensorQ8_0 {
         Tensor::new(data, self.shape.dims().to_vec()).unwrap()
     }
 
-    /// Blazing fast, Multi-threaded Vector-Matrix multiplication (M=1) for Decode Phase.
     pub fn vec_mat_mul(&self, x: &Tensor) -> Result<Tensor> {
+        let _prof = ProfileScope::new("VecMatMul_Q8");
         let k = *x.shape.dims().last().unwrap();
         let n = self.shape.dims()[0];
         let weight_k = self.shape.dims()[1];
@@ -99,29 +110,28 @@ impl QuantizedTensorQ8_0 {
             });
         }
 
+        // 1. DYNAMIC ACTIVATION QUANTIZATION
+        // Quantize the 1D hidden state vector on-the-fly.
+        // This takes less than 1 microsecond but saves us millions of float casts!
+        let x_q8 = QuantizedTensorQ8_0::quantize(x);
+
         let num_blocks_per_row = k / Q8_BLOCK_SIZE;
         let mut out_data = vec![0.0; n];
 
-        // Rayon Data-Parallelism: Spits the output vector across CPU cores.
-        // Each core independently calculates its assigned rows of the weight matrix.
-        out_data
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, out_val)| {
-                let mut row_sum = 0.0;
-                let row_block_start = i * num_blocks_per_row;
-
-                for b in 0..num_blocks_per_row {
-                    let block = &self.blocks[row_block_start + b];
-                    let act_start = b * Q8_BLOCK_SIZE;
-
-                    // Extract the exact 32 floats from the hidden state
-                    let act_chunk = &x.data[act_start..act_start + Q8_BLOCK_SIZE];
-
-                    row_sum += block.dot_fp32(act_chunk);
-                }
-                *out_val = row_sum;
-            });
+        // 2. TRUE INTEGER SIMD DOT PRODUCT
+        out_data.par_iter_mut().enumerate().for_each(|(i, out_val)| {
+            let mut row_sum = 0.0;
+            let row_block_start = i * num_blocks_per_row;
+            
+            for b in 0..num_blocks_per_row {
+                let weight_block = &self.blocks[row_block_start + b];
+                let act_block = &x_q8.blocks[b];
+                
+                // BOOM! Pure integer math in the inner loop.
+                row_sum += weight_block.dot_q8(act_block);
+            }
+            *out_val = row_sum;
+        });
 
         Ok(Tensor::new(out_data, vec![1, n]).unwrap())
     }

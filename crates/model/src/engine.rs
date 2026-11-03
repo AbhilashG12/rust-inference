@@ -26,6 +26,15 @@ pub struct LlmEngine {
 impl LlmEngine {
     pub fn load(model_path: &str, tokenizer_path: &str) -> Self {
         println!(" Loading model weights into RAM (this may take a few seconds)...");
+        
+        // Lock Rayon to Physical Cores only. This eliminates HyperThreading cache contention
+        // and keeps threads "hot" for the M=1 decode phase!
+        let physical_cores = num_cpus::get_physical();
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(physical_cores)
+            .build_global();
+        println!(" Optimized Thread Pool initialized with {} physical cores.", physical_cores);
+
         let mut weights = ModelLoader::load_safetensors(model_path).expect("Failed to load model");
         let tokenizer = Tokenizer::load(tokenizer_path).expect("Failed to load tokenizer");
 
@@ -133,20 +142,18 @@ impl LlmEngine {
             lm_head,
         }
     }
-    pub fn generate_streaming<F>(
-        &self,
-        prompt: &str,
-        config: GenerationConfig,
-        mut on_token: F,
-    ) -> GenerationOutput
+
+    pub fn generate_streaming<F>(&self, prompt: &str, config: GenerationConfig, mut on_token: F) -> GenerationOutput 
     where
-        F: FnMut(&str),
+        F: FnMut(&str)
     {
         let mut tokens = self.tokenizer.encode(prompt);
         let prompt_len = tokens.len();
         let num_layers = self.blocks.len();
-        let mut kv_cache = KVCache::new(num_layers);
-
+        
+        // Give the cache a 2048 token max capacity boundary!
+        let mut kv_cache = KVCache::new(num_layers, 2048); 
+        
         let start_time = std::time::Instant::now();
         let mut ttft_ms = 0;
         let mut generated_count = 0;
@@ -167,17 +174,20 @@ impl LlmEngine {
         for pos in 0..prompt_len {
             let token_id = tokens[pos];
             let mut hidden_state = self.embedding.forward(token_id as usize);
-
+            
             for (i, block) in self.blocks.iter().enumerate() {
                 hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
             }
-
+            
+            // CRITICAL: Increment the cache clock AFTER all layers process the token
+            kv_cache.current_seq_len += 1; 
+            
             if pos == prompt_len - 1 {
                 hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
                 let logits = self.lm_head.forward(&hidden_state).unwrap();
                 let next_token = Sampler::sample(&logits, &config, &tokens);
                 let next_word = self.tokenizer.decode(next_token);
-
+                
                 ttft_ms = start_time.elapsed().as_millis() as u64;
                 if next_token != 0 && next_token != 2 && !next_word.contains("<|im_end|>") {
                     output_text.push_str(&next_word);
@@ -199,6 +209,9 @@ impl LlmEngine {
                 hidden_state = block.forward(&hidden_state, pos, i, &mut kv_cache).unwrap();
             }
             
+            // CRITICAL: Increment the cache clock AFTER all layers process the token
+            kv_cache.current_seq_len += 1;
+            
             hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
             let logits = self.lm_head.forward(&hidden_state).unwrap();
             
@@ -215,6 +228,7 @@ impl LlmEngine {
             tokens.push(next_token);
             generated_count += 1;
         }
+
         let hidden_dim = self.final_norm.shape.dims()[0];
         let bytes_per_token = 2 * num_layers * hidden_dim * 4;
         let total_kv_mb = (bytes_per_token * tokens.len()) as f32 / (1024.0 * 1024.0);
