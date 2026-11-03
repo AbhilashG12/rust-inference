@@ -37,7 +37,7 @@ impl TransformerBlock {
 
         let mut q = self.w_q.forward(&norm_x)?;
         let mut k = self.w_k.forward(&norm_x)?;
-        let mut v = self.w_v.forward(&norm_x)?;
+        let v = self.w_v.forward(&norm_x)?;
 
         // Notice: `repeat_features` is entirely deleted!
         q = q.apply_rope(pos);

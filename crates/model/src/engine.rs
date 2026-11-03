@@ -27,14 +27,22 @@ impl LlmEngine {
     pub fn load(model_path: &str, tokenizer_path: &str) -> Self {
         println!(" Loading model weights into RAM (this may take a few seconds)...");
         
-        // Lock Rayon to Physical Cores only. This eliminates HyperThreading cache contention
-        // and keeps threads "hot" for the M=1 decode phase!
-        let physical_cores = num_cpus::get_physical();
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(physical_cores)
-            .build_global();
-        println!(" Optimized Thread Pool initialized with {} physical cores.", physical_cores);
-
+       // 1. ASYMMETRIC THREAD PINNING
+        // Lock Rayon threads to Physical Cores. This eliminates OS context-switching
+        // and keeps the L1 cache hot for the memory-bound Decode phase!
+        if let Some(core_ids) = core_affinity::get_core_ids() {
+            let physical_cores = core_ids.len();
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(physical_cores)
+                .start_handler(move |thread_idx| {
+                    // Pin this specific Rayon worker thread to a specific physical core
+                    if let Some(core_id) = core_ids.get(thread_idx % core_ids.len()) {
+                        core_affinity::set_for_current(*core_id);
+                    }
+                })
+                .build_global();
+            println!(" Optimized Thread Pool initialized and pinned to {} physical cores.", physical_cores);
+        }
         let mut weights = ModelLoader::load_safetensors(model_path).expect("Failed to load model");
         let tokenizer = Tokenizer::load(tokenizer_path).expect("Failed to load tokenizer");
 

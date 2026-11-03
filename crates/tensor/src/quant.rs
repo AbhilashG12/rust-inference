@@ -2,7 +2,6 @@ use crate::error::{Result, TensorError};
 use crate::shape::Shape;
 use crate::tensor::Tensor;
 use rayon::prelude::*; // Ensure this matches your error path
-use crate::profiler::ProfileScope;
 /// Standard block size for Q8_0 quantization (same as GGML/llama.cpp)
 pub const Q8_BLOCK_SIZE: usize = 32;
 
@@ -97,8 +96,10 @@ impl QuantizedTensorQ8_0 {
         Tensor::new(data, self.shape.dims().to_vec()).unwrap()
     }
 
+    /// Blazing fast, Coarse-Grained Multi-threaded Vector-Matrix multiplication (M=1)
     pub fn vec_mat_mul(&self, x: &Tensor) -> Result<Tensor> {
-        let _prof = ProfileScope::new("VecMatMul_Q8");
+        let _prof = crate::profiler::ProfileScope::new("VecMatMul_Q8");
+        
         let k = *x.shape.dims().last().unwrap();
         let n = self.shape.dims()[0];
         let weight_k = self.shape.dims()[1];
@@ -111,26 +112,35 @@ impl QuantizedTensorQ8_0 {
         }
 
         // 1. DYNAMIC ACTIVATION QUANTIZATION
-        // Quantize the 1D hidden state vector on-the-fly.
-        // This takes less than 1 microsecond but saves us millions of float casts!
         let x_q8 = QuantizedTensorQ8_0::quantize(x);
 
         let num_blocks_per_row = k / Q8_BLOCK_SIZE;
         let mut out_data = vec![0.0; n];
 
-        // 2. TRUE INTEGER SIMD DOT PRODUCT
-        out_data.par_iter_mut().enumerate().for_each(|(i, out_val)| {
-            let mut row_sum = 0.0;
-            let row_block_start = i * num_blocks_per_row;
-            
-            for b in 0..num_blocks_per_row {
-                let weight_block = &self.blocks[row_block_start + b];
-                let act_block = &x_q8.blocks[b];
+        // 2. COARSE-GRAINED THREAD CHUNKING
+        // Instead of spawning a task per row, spawn exactly ONE task per core.
+        let physical_cores = rayon::current_num_threads();
+        let chunk_size = (n + physical_cores - 1) / physical_cores; // Round up division
+
+        out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
+            let start_row = chunk_idx * chunk_size;
+
+            for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                let global_row = start_row + i;
                 
-                // BOOM! Pure integer math in the inner loop.
-                row_sum += weight_block.dot_q8(act_block);
+                // Safety bound in case the matrix rows don't divide perfectly by core count
+                if global_row >= n { break; } 
+
+                let mut row_sum = 0.0;
+                let row_block_start = global_row * num_blocks_per_row;
+                
+                for b in 0..num_blocks_per_row {
+                    let weight_block = &self.blocks[row_block_start + b];
+                    let act_block = &x_q8.blocks[b];
+                    row_sum += weight_block.dot_q8(act_block);
+                }
+                *out_val = row_sum;
             }
-            *out_val = row_sum;
         });
 
         Ok(Tensor::new(out_data, vec![1, n]).unwrap())

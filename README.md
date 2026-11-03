@@ -88,26 +88,26 @@ The following benchmark measures a full local forward pass on CPU, compared dire
 
 ### Environment & Setup
 
-| Setting   | This Engine                                  | llama.cpp (baseline)                         |
-| --------- | -------------------------------------------- | -------------------------------------------- |
-| Model     | SmolLM-135M-Instruct                         | SmolLM-135M-Instruct                         |
-| Precision | BF16 disk → FP32 compute                     | F16                                          |
-| Backend   | Rust CPU (AVX2 SIMD)                         | GGML (CPU)                                   |
-| KV Cache  | Enabled                                      | Enabled                                      |
-| GQA       | Enabled                                      | Enabled                                      |
-| Prompt    | "Rust is a systems programming language that" | same                                         |
+| Setting   | This Engine                                   | llama.cpp (baseline)                          |
+| --------- | --------------------------------------------- | --------------------------------------------- |
+| Model     | SmolLM-135M-Instruct                          | SmolLM-135M-Instruct                          |
+| Precision | BF16 disk → FP32 compute                      | F16                                           |
+| Backend   | Rust CPU (AVX2 SIMD)                          | GGML (CPU)                                    |
+| KV Cache  | Enabled                                       | Enabled                                       |
+| GQA       | Enabled                                       | Enabled                                       |
+| Prompt    | "Rust is a systems programming language that" | "Rust is a systems programming language that" |
 
 ### This Engine — Performance Metrics
 
-| Metric                  | Value                 |
-| ----------------------- | --------------------- |
+| Metric                  | Value                  |
+| ----------------------- | ---------------------- |
 | Prompt tokens           | 8 (raw) / ~30 (ChatML) |
-| Generated tokens        | 50 – 200              |
-| Prefill latency         | 779.36 ms             |
-| Decode latency (50 tok) | 5081.29 ms            |
-| Decode speed            | 9.84 tokens/sec       |
-| KV cache memory/token   | 135.00 KB             |
-| Total KV cache memory   | 7965.00 KB (~7.78 MB) |
+| Generated tokens        | 50 – 200               |
+| Prefill latency         | 779.36 ms              |
+| Decode latency (50 tok) | 5081.29 ms             |
+| Decode speed            | 9.84 tokens/sec        |
+| KV cache memory/token   | 135.00 KB              |
+| Total KV cache memory   | 7965.00 KB (~7.78 MB)  |
 
 ### Operator Profiling
 
@@ -128,9 +128,9 @@ MatMul is effectively the entire cost of a forward pass — every future optimiz
 
 This engine is roughly **4–5x slower** than llama.cpp on identical hardware and prompt. That gap is expected against a project with years of dedicated CPU-kernel engineering — the useful part is understanding *why*:
 
-* **Decode is memory-bandwidth-bound, not compute-bound.** Each decode step is a matrix × *vector* operation (one new token against the weight matrices), not matrix × matrix — so the bottleneck is bytes streamed from RAM per token, not FLOPs/sec.
-* **Precision compounds this directly.** This engine upcasts weights to FP32 in memory (4 bytes/weight); llama.cpp's GGUF keeps weights in F16 (2 bytes/weight) — roughly half the memory traffic per token before any kernel-quality difference even enters.
-* llama.cpp's GGML kernels are specifically hand-tuned for this single-token (`M=1`) regime; this engine's AVX2 path is not yet specialized for it.
+- **Decode is memory-bandwidth-bound, not compute-bound.** Each decode step is a matrix × *vector* operation (one new token against the weight matrices), not matrix × matrix — so the bottleneck is bytes streamed from RAM per token, not FLOPs/sec.
+- **Precision compounds this directly.** This engine upcasts weights to FP32 in memory (4 bytes/weight); llama.cpp's GGUF keeps weights in F16 (2 bytes/weight) — roughly half the memory traffic per token before any kernel-quality difference even enters.
+- **llama.cpp's GGML kernels are specifically hand-tuned** for this single-token (`M=1`) regime; this engine's AVX2 path is not yet specialized for it.
 
 **Next optimization target, in order:**
 
@@ -179,7 +179,6 @@ cargo run --release -- inspect --model smollm-instruct.safetensors
 
 Having established a mathematically sound, benchmarked baseline, future development will focus on scaling and optimization:
 
-* **Quantization & Native Half-Precision Compute (highest priority — see benchmark analysis above):** Native F16/BF16 weight storage in RAM first, then INT8/INT4 quantized kernels for larger models (like Llama-3-8B).
-* **Sampling & Grammar Constraints:** Refining Top-K/Top-P sampling and adding formal grammar/schema state machines for guaranteed structured outputs.
-* **Serving Architecture:** Paged KV Cache and continuous batching.
-* **Hardware Backends:** Exploring GPU execution (CUDA/Metal).
+- **Quantization & Native Half-Precision Compute (highest priority — see benchmark analysis above):** Native F16/BF16 weight storage in RAM first, then INT8/INT4 quantized kernels for larger models (like Llama-3-8B).
+- **Sampling & Grammar Constraints:** Refining Top-K/Top-P sampling and adding formal grammar/schema state machines for guaranteed structured outputs.
+- **Serving Architecture:** Paged KV Cache and continuous batching.
