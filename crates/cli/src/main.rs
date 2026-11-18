@@ -1,14 +1,17 @@
 use clap::{Parser, Subcommand};
 use model::LlmEngine;
-use model::loader::ModelLoader;
+use model::embedder::EmbedderEngine;
+use model::rag::{DocumentStore, VectorStore};
+use model::tokenizer::Tokenizer;
 use tensor::profiler::PROFILER;
 use tensor::sampler::GenerationConfig;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(
     name = "rustinfer",
     version = "1.0",
-    about = "Pure-Rust LLM Inference Engine"
+    about = "Pure-Rust LLM Inference Engine & Air-Gapped RAG"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -22,15 +25,29 @@ enum Commands {
         model: String,
     },
     Generate {
-        #[arg(long, default_value = "tiny_llama.safetensors")]
+        #[arg(long, default_value = "smollm-instruct.safetensors")]
         model: String,
-        #[arg(long, default_value = "tokenizer.json")]
+        #[arg(long, default_value = "smollm_instruct_tokenizer.json")]
         tokenizer: String,
         #[arg(long)]
         prompt: String,
         #[arg(long, default_value_t = false)]
         profile: bool,
     },
+    Rag {
+        #[arg(long, default_value = "smollm-instruct.safetensors")]
+        llm: String,
+        #[arg(long, default_value = "smollm_instruct_tokenizer.json")]
+        llm_tokenizer: String,
+        #[arg(long, default_value = "minilm-l6-v2.safetensors")]
+        embedder: String,
+        #[arg(long, default_value = "minilm_tokenizer.json")]
+        embedder_tokenizer: String,
+        #[arg(long)]
+        docs_dir: String,
+        #[arg(long)]
+        prompt: String,
+    }
 }
 
 fn main() {
@@ -38,48 +55,76 @@ fn main() {
 
     match &cli.command {
         Commands::Inspect { model } => {
+            // [Keep your existing Inspect logic exactly as it is...]
             println!("🔍 Inspecting Model: {}", model);
-            match ModelLoader::load_safetensors(model) {
-                Ok(weights) => {
-                    println!(" Successfully parsed {} tensors.", weights.len());
-                    let mut total_bytes = 0;
-                    for (name, weight) in weights.iter() {
-                        match weight {
-                            model::loader::LoadedWeight::Fp32(t) => {
-                                total_bytes += t.data.len() * 4; // f32 is 4 bytes
-                                println!("   - {} [FP32]: {:?}", name, t.shape.dims());
-                            }
-                            model::loader::LoadedWeight::Q8(q) => {
-                                // Q8_0 uses a 36-byte block (32 bytes of i8 weights + 4 byte f32 scale)
-                                total_bytes += q.blocks.len() * 36;
-                                println!("   - {} [Q8_0]: {:?}", name, q.shape.dims());
-                            }
-                        }
-                    }
-                    println!(
-                        "\n Total Unquantized Size: {:.2} MB",
-                        total_bytes as f64 / 1024.0 / 1024.0
-                    );
-                }
-                Err(e) => println!(" Error loading model: {}", e),
+        }
+        
+        Commands::Generate { model, tokenizer, prompt, profile } => {
+            // [Keep your existing Generate logic exactly as it is...]
+            let engine = LlmEngine::load(model, tokenizer);
+            engine.generate(prompt, GenerationConfig::default());
+            if *profile {
+                if let Ok(prof) = PROFILER.lock() { prof.print_summary(); }
             }
         }
-        Commands::Generate {
-            model,
-            tokenizer,
-            prompt,
-            profile,
-        } => {
-            let engine = LlmEngine::load(model, tokenizer);
-            let config = GenerationConfig::default();
+        
+        Commands::Rag { llm, llm_tokenizer, embedder, embedder_tokenizer, docs_dir, prompt } => {
+            println!("--- [1] Booting Air-Gapped FDE Engine ---");
+            let llm_engine = LlmEngine::load(llm, llm_tokenizer);
+            
+            // Phase 1: Load the 20M parameter semantic encoder
+            let embed_engine = EmbedderEngine::load(embedder, embedder_tokenizer);
+            let embed_tok = Tokenizer::load(embedder_tokenizer).unwrap();
 
-            engine.generate(prompt, config);
+            println!("\n--- [2] Ingesting Local Documents ---");
+            let mut doc_store = DocumentStore::new();
+            let start = Instant::now();
+            doc_store.ingest_directory(docs_dir, &embed_tok, 256, 32);
+            
+            let mut vec_store = VectorStore::new();
+            vec_store.embed_store(&doc_store, &embed_engine);
+            println!(" Indexing took: {:.2}s", start.elapsed().as_secs_f32());
 
-            if *profile {
-                if let Ok(prof) = PROFILER.lock() {
-                    prof.print_summary();
-                }
+            println!("\n--- [3] Vector Search ---");
+            let search_start = Instant::now();
+            let top_3_indices = vec_store.search(prompt, &embed_engine, 3);
+            println!(" Search completed in: {:.2}ms", search_start.elapsed().as_millis());
+
+            let mut context_text = String::new();
+            for (rank, &idx) in top_3_indices.iter().enumerate() {
+                let chunk = &doc_store.chunks[idx];
+                println!("  -> Match {}: [{}]", rank + 1, chunk.source_file);
+                context_text.push_str(&chunk.text);
+                context_text.push_str("\n\n");
             }
+
+            println!("\n--- [4] Context-Aware Generation ---");
+            use std::io::Write;
+            
+            // Bypass ChatML special tokens and use a strict, uppercase instruction block
+            let augmented_prompt = format!(
+                "SYSTEM: You are a strict data extraction AI. Read the CONTEXT below and answer the user's QUESTION. Do not invent information. If the answer is not in the CONTEXT, reply 'I do not know'.\n\nCONTEXT:\n{}\n\nQUESTION:\n{}\n\nANSWER:\n",
+                context_text.trim(), prompt
+            );
+
+            let mut config = GenerationConfig::default();
+            config.temperature = 0.0; // 0.0 forces absolute deterministic output
+
+            print!(" Crunching document context (Prefill phase)... ");
+            std::io::stdout().flush().unwrap();
+
+            let prefill_start = Instant::now();
+            let mut first_token = true;
+
+            llm_engine.generate_streaming(&augmented_prompt, config, |token| {
+                if first_token {
+                    println!("Done! ({:.2}s)\n", prefill_start.elapsed().as_secs_f32());
+                    first_token = false;
+                }
+                print!("{}", token);
+                std::io::stdout().flush().unwrap();
+            });
+            println!("\n--------------------------------------------------");
         }
     }
 }

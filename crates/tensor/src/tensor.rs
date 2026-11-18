@@ -36,6 +36,89 @@ impl Tensor {
         }
     }
 
+    /// Standard LayerNorm (subtracts mean, divides by variance, adds bias).
+    /// Used by BERT/MiniLM encoder architectures.
+    pub fn layer_norm(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Self> {
+        let seq_len = self.shape.dims()[0];
+        let hidden_dim = self.shape.dims()[1];
+        let mut out = vec![0.0; self.data.len()];
+
+        for i in 0..seq_len {
+            let offset = i * hidden_dim;
+            let row = &self.data[offset..offset + hidden_dim];
+            
+            let mean = row.iter().sum::<f32>() / hidden_dim as f32;
+            let var = row.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / hidden_dim as f32;
+            let std = (var + eps).sqrt();
+
+            for j in 0..hidden_dim {
+                out[offset + j] = ((row[j] - mean) / std) * weight.data[j] + bias.data[j];
+            }
+        }
+        Tensor::new(out, self.shape.dims().to_vec())
+    }
+
+    /// GELU Activation Function (Gaussian Error Linear Unit).
+    pub fn gelu(&self) -> Result<Self> {
+        let mut out = Vec::with_capacity(self.data.len());
+        for &x in &self.data {
+            // Blazing fast GELU approximation used in BERT
+            let c = (2.0f32 / std::f32::consts::PI).sqrt();
+            let val = 0.5 * x * (1.0 + (c * (x + 0.044715 * x.powi(3))).tanh());
+            out.push(val);
+        }
+        Tensor::new(out, self.shape.dims().to_vec())
+    }
+
+    /// Bi-directional Attention. 
+    /// No Causal Mask. No KV Cache. Every token looks at every other token.
+    pub fn attention_bidirectional(q: &Tensor, k: &Tensor, v: &Tensor, num_heads: usize) -> Result<Self> {
+        let seq_len = q.shape.dims()[0];
+        let hidden_dim = q.shape.dims()[1];
+        let head_dim = hidden_dim / num_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut out = vec![0.0; seq_len * hidden_dim];
+
+        // Process each attention head
+        for h in 0..num_heads {
+            let head_offset = h * head_dim;
+
+            for i in 0..seq_len {
+                let q_row = i * hidden_dim + head_offset;
+                let mut scores = vec![0.0; seq_len];
+
+                // 1. Q * K^T (Bi-directional, looks at all tokens 'j')
+                for j in 0..seq_len {
+                    let k_row = j * hidden_dim + head_offset;
+                    let mut dot = 0.0;
+                    for d in 0..head_dim {
+                        dot += q.data[q_row + d] * k.data[k_row + d];
+                    }
+                    scores[j] = dot * scale;
+                }
+
+                // 2. Softmax
+                let max_val = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0;
+                for j in 0..seq_len {
+                    scores[j] = (scores[j] - max_val).exp();
+                    sum_exp += scores[j];
+                }
+
+                // 3. Scores * V
+                for j in 0..seq_len {
+                    let prob = scores[j] / sum_exp;
+                    let v_row = j * hidden_dim + head_offset;
+                    for d in 0..head_dim {
+                        out[q_row + d] += prob * v.data[v_row + d];
+                    }
+                }
+            }
+        }
+        Tensor::new(out, vec![seq_len, hidden_dim])
+    }
+
     pub fn attention_kv_cached(
         q: &Tensor,
         layer_idx: usize,

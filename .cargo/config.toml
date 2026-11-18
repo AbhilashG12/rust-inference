@@ -1,2 +1,7 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+lto = "fat"            # Enables heavy cross-crate optimization
+codegen-units = 1      # Compiles as a single unit for maximum speed
+panic = "abort"        # Removes panic-unwinding overhead

@@ -66,7 +66,10 @@ impl ModelLoader {
                         f32::from_bits(f32_bits)
                     })
                     .collect(),
-                other => panic!("Unsupported dtype in safetensors: {:?}", other),
+                _ => {
+        println!("   - Skipping tensor '{}' (Unsupported dtype)", name);
+        continue;
+    }
             };
 
             let raw_tensor = Tensor::new(data, shape).map_err(|_| LoaderError::EngineError)?;
