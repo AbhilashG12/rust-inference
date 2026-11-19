@@ -6,6 +6,9 @@ use model::tokenizer::Tokenizer;
 use tensor::profiler::PROFILER;
 use tensor::sampler::GenerationConfig;
 use std::time::Instant;
+use std::path::Path;
+use std::io::Write;
+use std::io;
 
 #[derive(Parser)]
 #[command(
@@ -45,9 +48,15 @@ enum Commands {
         embedder_tokenizer: String,
         #[arg(long)]
         docs_dir: String,
+        #[arg(long, default_value = "rag_index.ridx")]
+        index: String,
+        #[arg(long, default_value_t = false)]
+        reindex: bool,
+        #[arg(long, default_value_t = 0.36)]
+        threshold: f32,
         #[arg(long)]
-        prompt: String,
-    }
+        prompt: Option<String>,
+    },
 }
 
 fn main() {
@@ -68,63 +77,161 @@ fn main() {
             }
         }
         
-        Commands::Rag { llm, llm_tokenizer, embedder, embedder_tokenizer, docs_dir, prompt } => {
+       Commands::Rag {
+            llm,
+            llm_tokenizer,
+            embedder,
+            embedder_tokenizer,
+            docs_dir,
+            index,
+            reindex,
+            threshold,
+            prompt,
+        } => {
             println!("--- [1] Booting Air-Gapped FDE Engine ---");
             let llm_engine = LlmEngine::load(llm, llm_tokenizer);
-            
-            // Phase 1: Load the 20M parameter semantic encoder
             let embed_engine = EmbedderEngine::load(embedder, embedder_tokenizer);
-            let embed_tok = Tokenizer::load(embedder_tokenizer).unwrap();
 
-            println!("\n--- [2] Ingesting Local Documents ---");
-            let mut doc_store = DocumentStore::new();
+            println!("\n--- [2] Loading Knowledge Base ---");
             let start = Instant::now();
-            doc_store.ingest_directory(docs_dir, &embed_tok, 256, 32);
-            
-            let mut vec_store = VectorStore::new();
-            vec_store.embed_store(&doc_store, &embed_engine);
-            println!(" Indexing took: {:.2}s", start.elapsed().as_secs_f32());
+            let (doc_store, vec_store) = if !reindex && Path::new(index).exists() {
+                println!(" Loading cached binary index from '{}'...", index);
+                VectorStore::load_index(index).expect("Failed to load .ridx cache")
+            } else {
+                let embed_tok = Tokenizer::load(embedder_tokenizer).unwrap();
+                let mut docs = DocumentStore::new();
+                docs.ingest_directory(docs_dir, &embed_tok, 85,15);
 
-            println!("\n--- [3] Vector Search ---");
-            let search_start = Instant::now();
-            let top_3_indices = vec_store.search(prompt, &embed_engine, 3);
-            println!(" Search completed in: {:.2}ms", search_start.elapsed().as_millis());
-
-            let mut context_text = String::new();
-            for (rank, &idx) in top_3_indices.iter().enumerate() {
-                let chunk = &doc_store.chunks[idx];
-                println!("  -> Match {}: [{}]", rank + 1, chunk.source_file);
-                context_text.push_str(&chunk.text);
-                context_text.push_str("\n\n");
-            }
-
-            println!("\n--- [4] Context-Aware Generation ---");
-            use std::io::Write;
-            
-            // Bypass ChatML special tokens and use a strict, uppercase instruction block
-            let augmented_prompt = format!(
-                "SYSTEM: You are a strict data extraction AI. Read the CONTEXT below and answer the user's QUESTION. Do not invent information. If the answer is not in the CONTEXT, reply 'I do not know'.\n\nCONTEXT:\n{}\n\nQUESTION:\n{}\n\nANSWER:\n",
-                context_text.trim(), prompt
+                let mut vecs = VectorStore::new();
+                vecs.embed_store(&docs, &embed_engine);
+                vecs.save_index(&docs, index).expect("Failed to save .ridx cache");
+                println!(" Saved binary index to '{}'.", index);
+                (docs, vecs)
+            };
+            println!(
+                " Knowledge Base ready ({} chunks) in {:.2}s.",
+                doc_store.chunks.len(),
+                start.elapsed().as_secs_f32()
             );
 
-            let mut config = GenerationConfig::default();
-            config.temperature = 0.0; // 0.0 forces absolute deterministic output
+            if let Some(q) = prompt {
+                run_rag_query(&llm_engine, &embed_engine, &doc_store, &vec_store, q, *threshold);
+            } else {
+                println!("\n--- Interactive Air-Gapped RAG REPL (type 'exit' to quit) ---");
+                let stdin = io::stdin();
+                loop {
+                    print!("\nrag> ");
+                    io::stdout().flush().unwrap();
 
-            print!(" Crunching document context (Prefill phase)... ");
-            std::io::stdout().flush().unwrap();
-
-            let prefill_start = Instant::now();
-            let mut first_token = true;
-
-            llm_engine.generate_streaming(&augmented_prompt, config, |token| {
-                if first_token {
-                    println!("Done! ({:.2}s)\n", prefill_start.elapsed().as_secs_f32());
-                    first_token = false;
+                    let mut input = String::new();
+                    if stdin.read_line(&mut input).is_err() {
+                        break;
+                    }
+                    let q = input.trim();
+                    if q.is_empty() {
+                        continue;
+                    }
+                    if q.eq_ignore_ascii_case("exit") || q.eq_ignore_ascii_case("quit") {
+                        break;
+                    }
+                    run_rag_query(&llm_engine, &embed_engine, &doc_store, &vec_store, q, *threshold);
                 }
-                print!("{}", token);
-                std::io::stdout().flush().unwrap();
-            });
-            println!("\n--------------------------------------------------");
+            }
         }
     }
+}
+
+fn run_rag_query(
+    llm_engine: &LlmEngine,
+    embed_engine: &EmbedderEngine,
+    doc_store: &DocumentStore,
+    vec_store: &VectorStore,
+    query: &str,
+    threshold: f32,
+) {
+    let search_start = Instant::now();
+    let matches = vec_store.search(query, doc_store, embed_engine, 3, threshold);
+    let search_ms = search_start.elapsed().as_millis();
+
+    println!(
+        "\n--- [Retrieval] {}ms ({} matches >= {:.2}) ---",
+        search_ms,
+        matches.len(),
+        threshold
+    );
+
+    if matches.is_empty() {
+        println!("Answer: I do not have data on this. (Short-circuited LLM)");
+        return;
+    }
+
+    let mut context_text = String::new();
+    for (rank, &(idx, score)) in matches.iter().enumerate() {
+        let chunk = &doc_store.chunks[idx];
+        println!(
+            "  -> Match {}: [{}] (score: {:.3})",
+            rank + 1,
+            chunk.source_file,
+            score
+        );
+        context_text.push_str(&chunk.text);
+        context_text.push_str("\n\n");
+    }
+
+    let augmented_prompt = format!(
+        "SYSTEM: You are a helpful data extraction assistant. Read the CONTEXT below and answer the user's QUESTION in one clear, complete English sentence. Do not output raw lists, pipes, or key-value pairs. If the answer is not in the CONTEXT, reply 'I do not know'.\n\nCONTEXT:\n{}\n\nQUESTION:\n{}\n\nANSWER:\n",
+        context_text.trim(),
+        query
+    );
+
+    let mut config = GenerationConfig::default();
+    config.temperature = 0.0;
+    config.max_tokens = 64;
+
+    print!("\n--- [Generation] Prefilling KV Cache... ");
+    io::stdout().flush().unwrap();
+
+    let mut first_token = true;
+    let mut generated = String::new();
+    let _stopped = false;
+
+    let output = llm_engine.generate_streaming(&augmented_prompt, config, |token| {
+        if first_token {
+            println!("Done! ---\n");
+            first_token = false;
+        }
+
+        generated.push_str(token);
+        let trimmed = generated.trim_start();
+
+        if !trimmed.is_empty()
+            && (trimmed.contains("\n\n")
+                || trimmed.contains("\nQUESTION")
+                || trimmed.contains("\nSystem:")
+                || trimmed.contains("\nSYSTEM:")
+                || trimmed.contains("\nCONTEXT:"))
+        {
+            return false;
+        }
+
+        print!("{}", token);
+        io::stdout().flush().unwrap();
+        true
+    });
+
+    let decode_ms = output.total_latency_ms.saturating_sub(output.ttft_ms);
+    let tok_per_sec = if decode_ms > 0 {
+        (output.completion_tokens as f64) / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+
+    println!(
+        "\n\n[Telemetry] Prompt: {} tok | TTFT: {:.2}s | Decode: {} tok ({:.1} tok/s) | KV: {:.2} MB",
+        output.prompt_tokens,
+        output.ttft_ms as f64 / 1000.0,
+        output.completion_tokens,
+        tok_per_sec,
+        output.kv_memory_mb
+    );
 }

@@ -153,7 +153,7 @@ impl LlmEngine {
 
     pub fn generate_streaming<F>(&self, prompt: &str, config: GenerationConfig, mut on_token: F) -> GenerationOutput 
     where
-        F: FnMut(&str)
+        F: FnMut(&str) -> bool
     {
         let mut tokens = self.tokenizer.encode(prompt);
         let prompt_len = tokens.len();
@@ -199,9 +199,21 @@ impl LlmEngine {
                 ttft_ms = start_time.elapsed().as_millis() as u64;
                 if next_token != 0 && next_token != 2 && !next_word.contains("<|im_end|>") {
                     output_text.push_str(&next_word);
-                    on_token(&next_word);
                     tokens.push(next_token);
                     generated_count += 1;
+                    if !on_token(&next_word) {
+                        // Early stop requested
+                        let hidden_dim = self.final_norm.shape.dims()[0];
+                        let bytes_per_token = 2 * num_layers * hidden_dim * 4;
+                        return GenerationOutput {
+                            text: output_text,
+                            prompt_tokens: prompt_len,
+                            completion_tokens: generated_count,
+                            ttft_ms,
+                            total_latency_ms: start_time.elapsed().as_millis() as u64,
+                            kv_memory_mb: (bytes_per_token * tokens.len()) as f32 / (1024.0 * 1024.0),
+                        };
+                    }
                 }
             }
         }
@@ -232,9 +244,11 @@ impl LlmEngine {
             }
             
             output_text.push_str(&next_word);
-            on_token(&next_word);
             tokens.push(next_token);
             generated_count += 1;
+            if !on_token(&next_word) {
+                break;
+            }
         }
 
         let hidden_dim = self.final_norm.shape.dims()[0];
@@ -251,8 +265,155 @@ impl LlmEngine {
         }
     }
 
+    /// Greedy argmax over a [1, vocab_size] logits tensor.
+    fn greedy_token(logits: &Tensor) -> u32 {
+        logits
+            .data
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .unwrap_or(0)
+    }
+
+    fn is_eos(&self, token_id: u32, word: &str) -> bool {
+        token_id == 0
+            || token_id == 2
+            || word.contains("<|im_end|>")
+            || word.contains("<|endoftext|>")
+    }
+
+    /// Runs a single token through all layers, advances `kv_cache`, and returns the greedy next token.
+    fn forward_single_token(&self, token_id: u32, kv_cache: &mut KVCache) -> u32 {
+        let pos = kv_cache.current_seq_len;
+        let mut hidden_state = self.embedding.forward(token_id as usize);
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            hidden_state = block.forward(&hidden_state, pos, i, kv_cache).unwrap();
+        }
+        kv_cache.current_seq_len += 1;
+
+        hidden_state = hidden_state.rms_norm(&self.final_norm, 1e-5).unwrap();
+        let logits = self.lm_head.forward(&hidden_state).unwrap();
+        Self::greedy_token(&logits)
+    }
+
+    /// Prefills a slice of tokens into `kv_cache` without computing final logits.
+    fn prefill_tokens(&self, tokens: &[u32], kv_cache: &mut KVCache) {
+        for &token_id in tokens {
+            let pos = kv_cache.current_seq_len;
+            let mut hidden_state = self.embedding.forward(token_id as usize);
+            for (i, block) in self.blocks.iter().enumerate() {
+                hidden_state = block.forward(&hidden_state, pos, i, kv_cache).unwrap();
+            }
+            kv_cache.current_seq_len += 1;
+        }
+    }
+
+    /// Verifies a batch of tokens sequentially (ready to swap for parallel GEMM prefill later).
+    fn forward_batch(&self, tokens: &[u32], kv_cache: &mut KVCache) -> Vec<u32> {
+        let mut predictions = Vec::with_capacity(tokens.len());
+        for &token_id in tokens {
+            predictions.push(self.forward_single_token(token_id, kv_cache));
+        }
+        predictions
+    }
+
+    pub fn generate_speculative(
+        draft_engine: &LlmEngine,
+        target_engine: &LlmEngine,
+        prompt: &str,
+        k_drafts: usize, // e.g., 4
+    ) {
+        let prompt_tokens = draft_engine.tokenizer.encode(prompt);
+        if prompt_tokens.is_empty() {
+            return;
+        }
+
+        let mut draft_kv = KVCache::new(draft_engine.blocks.len(), 2048);
+        let mut target_kv = KVCache::new(target_engine.blocks.len(), 2048);
+
+        // Prefill all prompt tokens except the last one; the last token kicks off the loop
+        if prompt_tokens.len() > 1 {
+            let prefix = &prompt_tokens[..prompt_tokens.len() - 1];
+            target_engine.prefill_tokens(prefix, &mut target_kv);
+            draft_engine.prefill_tokens(prefix, &mut draft_kv);
+        }
+
+        let mut last_token = *prompt_tokens.last().unwrap();
+        let mut generated_count = 0;
+
+        while generated_count < 200 {
+            let base_seq_len = target_kv.current_seq_len;
+
+            // --- PHASE 1: DRAFTING ---
+            let mut draft_predictions = Vec::with_capacity(k_drafts);
+            let mut draft_input = last_token;
+            for _ in 0..k_drafts {
+                let next_token = draft_engine.forward_single_token(draft_input, &mut draft_kv);
+                draft_predictions.push(next_token);
+                draft_input = next_token;
+            }
+
+            // --- PHASE 2: VERIFICATION ---
+            // Target evaluates [last_token, d1, ..., dk] -> outputs k+1 predictions
+            let mut verify_inputs = Vec::with_capacity(k_drafts + 1);
+            verify_inputs.push(last_token);
+            verify_inputs.extend_from_slice(&draft_predictions);
+
+            let target_predictions = target_engine.forward_batch(&verify_inputs, &mut target_kv);
+
+            // --- PHASE 3: ACCEPTANCE & ROLLBACK ---
+            let mut accepted_count = 0;
+            let mut hit_eos = false;
+
+            for i in 0..k_drafts {
+                if draft_predictions[i] == target_predictions[i] {
+                    accepted_count += 1;
+                    let word = target_engine.tokenizer.decode(draft_predictions[i]);
+                    if target_engine.is_eos(draft_predictions[i], &word) {
+                        hit_eos = true;
+                        break;
+                    }
+                    print!("{}", word);
+                } else {
+                    break;
+                }
+            }
+
+            if hit_eos {
+                io::stdout().flush().unwrap();
+                break;
+            }
+
+            let correction_token = target_predictions[accepted_count];
+            let correction_word = target_engine.tokenizer.decode(correction_token);
+            if target_engine.is_eos(correction_token, &correction_word) {
+                io::stdout().flush().unwrap();
+                break;
+            }
+
+            print!("{}", correction_word);
+            io::stdout().flush().unwrap();
+
+            // Sync both KV caches to [base_seq_len + last_token + accepted drafts]
+            let valid_len = base_seq_len + 1 + accepted_count;
+            target_kv.rewind(valid_len);
+
+            if accepted_count == k_drafts {
+                // Draft only ran up to d_{k-1}, so feed d_k to match target_kv length
+                draft_engine.forward_single_token(draft_predictions[k_drafts - 1], &mut draft_kv);
+            } else {
+                draft_kv.rewind(valid_len);
+            }
+
+            last_token = correction_token;
+            generated_count += accepted_count + 1;
+        }
+    }
+
     pub fn generate_for_api(&self, prompt: &str, config: GenerationConfig) -> GenerationOutput {
-        self.generate_streaming(prompt, config, |_| {})
+        self.generate_streaming(prompt, config, |_| true)
     }
 
     pub fn generate(&self, prompt: &str, config: GenerationConfig) {
@@ -272,8 +433,8 @@ impl LlmEngine {
         let output = self.generate_streaming(&formatted_prompt, config, |token| {
             print!("{}", token);
             io::stdout().flush().unwrap();
+            true
         });
-
         println!("\n--------------------------------------------------");
         println!(" Performance Benchmarks:");
         println!("   - Latency: {:.2} ms", output.total_latency_ms);

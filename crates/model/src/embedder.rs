@@ -66,6 +66,7 @@ pub struct EmbedderEngine {
     tokenizer: Tokenizer,
     word_embeddings: Tensor,
     position_embeddings: Tensor,
+    token_type_embeddings: Tensor,
     emb_norm_weight: Tensor,
     emb_norm_bias: Tensor,
     blocks: Vec<BertBlock>,
@@ -124,6 +125,7 @@ impl EmbedderEngine {
             tokenizer,
             word_embeddings: get_fp32!("embeddings.word_embeddings.weight"),
             position_embeddings: get_fp32!("embeddings.position_embeddings.weight"),
+            token_type_embeddings: get_fp32!("embeddings.token_type_embeddings.weight"),
             emb_norm_weight: get_fp32!("embeddings.LayerNorm.weight"),
             emb_norm_bias: get_fp32!("embeddings.LayerNorm.bias"),
             blocks,
@@ -131,35 +133,46 @@ impl EmbedderEngine {
     }
 
     pub fn embed(&self, text: &str) -> Vec<f32> {
-        // 1. Tokenize and add WordPiece [CLS] and [SEP] special tokens
-        let formatted = format!("[CLS] {} [SEP]", text);
-        let tokens = self.tokenizer.encode(&formatted);
+        // 1. Tokenize and strip [PAD] (ID 0). MiniLM's tokenizer.json already adds [CLS] and [SEP].
+        let tokens: Vec<u32> = self
+            .tokenizer
+            .encode(text)
+            .into_iter()
+            .filter(|&id| id != 0)
+            .collect();
+
         let seq_len = tokens.len();
         let hidden_dim = self.word_embeddings.shape.dims()[1];
+        if seq_len == 0 {
+            return vec![0.0; hidden_dim];
+        }
 
-        // 2. Absolute Embeddings = Word + Position + TokenType(Zeros)
+        // 2. Absolute Embeddings = Word + Position
         let mut x_data = vec![0.0; seq_len * hidden_dim];
         for (pos, &token_id) in tokens.iter().enumerate() {
             let word_offset = (token_id as usize) * hidden_dim;
             let pos_offset = pos * hidden_dim;
             let target_offset = pos * hidden_dim;
-            
+
             for d in 0..hidden_dim {
-                x_data[target_offset + d] = 
-                    self.word_embeddings.data[word_offset + d] + 
-                    self.position_embeddings.data[pos_offset + d]; // TokenType is 0
+                x_data[target_offset + d] =
+                    self.word_embeddings.data[word_offset + d]
+                        + self.position_embeddings.data[pos_offset + d]
+                        + self.token_type_embeddings.data[d];
             }
         }
-        
+
         let mut hidden_state = Tensor::new(x_data, vec![seq_len, hidden_dim]).unwrap();
-        hidden_state = hidden_state.layer_norm(&self.emb_norm_weight, &self.emb_norm_bias, 1e-12).unwrap();
+        hidden_state = hidden_state
+            .layer_norm(&self.emb_norm_weight, &self.emb_norm_bias, 1e-12)
+            .unwrap();
 
         // 3. Encoder Blocks
         for block in &self.blocks {
             hidden_state = block.forward(&hidden_state).unwrap();
         }
 
-        // 4. Mean Pooling & L2 Normalization (The compression step)
+        // 4. Mean Pooling & L2 Normalization over REAL tokens only
         let mut pooled = vec![0.0; hidden_dim];
         for i in 0..seq_len {
             let offset = i * hidden_dim;
@@ -167,18 +180,18 @@ impl EmbedderEngine {
                 pooled[j] += hidden_state.data[offset + j];
             }
         }
-        
+
         let mut mag = 0.0;
         for j in 0..hidden_dim {
             pooled[j] /= seq_len as f32;
             mag += pooled[j] * pooled[j];
         }
-        
-        let mag = mag.sqrt();
+
+        let mag = mag.sqrt().max(1e-12);
         for j in 0..hidden_dim {
-            pooled[j] /= mag; // L2 Normalize for instant dot-product search later
+            pooled[j] /= mag;
         }
 
-        pooled // Returns a pristine [384] vector!
+        pooled
     }
 }

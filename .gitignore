@@ -2,4 +2,7 @@
 debug.py
 *.safetensors
 *.json
+docs
 llama_bench
+*.gguf
+*.ridx

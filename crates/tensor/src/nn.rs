@@ -8,7 +8,7 @@ pub struct Embedding {
 }
 
 pub struct Linear {
-    pub weight: QuantizedTensorQ8_0, // Now stores compressed 8-bit blocks!
+    pub weight: QuantizedTensorQ8_0,
     pub bias: Tensor,
 }
 
@@ -39,14 +39,11 @@ impl TransformerBlock {
         let mut k = self.w_k.forward(&norm_x)?;
         let v = self.w_v.forward(&norm_x)?;
 
-        // Notice: `repeat_features` is entirely deleted!
         q = q.apply_rope(pos);
         k = k.apply_rope(pos);
 
-        // Map the new token straight into the continuous buffer
         kv_cache.append(layer_idx, &k, &v);
 
-        // Extract attention scores reading natively from the flat array memory
         let attn_out = Tensor::attention_kv_cached(&q, layer_idx, kv_cache)?;
 
         let proj_out = self.w_o.forward(&attn_out)?;
@@ -56,11 +53,11 @@ impl TransformerBlock {
         let gate = self.ffn_gate.forward(&norm_res_1)?;
         let activated_gate = gate.silu();
         let up = self.ffn_up.forward(&norm_res_1)?;
-    
+
         let hidden = activated_gate.mul(&up)?;
         let ffn_out = self.ffn_down.forward(&hidden)?;
         let final_out = residual_1.add(&ffn_out)?;
-        
+
         Ok(final_out)
     }
 }
@@ -85,14 +82,21 @@ impl Linear {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let seq_len = x.shape.dims()[0];
+        let in_features = x.shape.dims()[1];
+        let out_features = self.weight.shape.dims()[0];
 
         let out = if seq_len == 1 {
-            // M=1 Decode Phase: Route to lightning-fast Q8 SIMD kernel
             self.weight.vec_mat_mul(x)?
         } else {
-            // Prefill Phase: Dequantize locally to run standard dense GEMM
-            let fp32_weight = self.weight.dequantize();
-            x.matmul(&fp32_weight)?
+            // Route each token through the Q8 AVX2 kernel without FP32 dequantization
+            let mut out_data = Vec::with_capacity(seq_len * out_features);
+            for i in 0..seq_len {
+                let row = x.data[i * in_features..(i + 1) * in_features].to_vec();
+                let row_tensor = Tensor::new(row, vec![1, in_features])?;
+                let res = self.weight.vec_mat_mul(&row_tensor)?;
+                out_data.extend_from_slice(&res.data);
+            }
+            Tensor::new(out_data, vec![seq_len, out_features])?
         };
 
         let out_with_bias = out.add_broadcast_1d(&self.bias)?;

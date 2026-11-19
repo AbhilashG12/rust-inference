@@ -25,6 +25,11 @@ impl KVCache {
         }
     }
 
+   pub fn rewind(&mut self, valid_seq_len: usize) {
+        assert!(valid_seq_len <= self.current_seq_len, "Cannot rewind forward");
+        self.current_seq_len = valid_seq_len;
+    }
+
     pub fn append(&mut self, layer_idx: usize, k: &Tensor, v: &Tensor) {
         // Lazy-allocation: We figure out head dimensions dynamically on token 0
         if !self.initialized {
